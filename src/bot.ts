@@ -363,13 +363,13 @@ export function createBot(
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
-      return showAlert(ctx, "Просроченный конфиг нельзя пересоздать.");
+      return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      `🔄 Пересоздать конфиг «${config.displayName}»?\n\nБудет создан новый файл на менее загруженном доступном сервере. Текущий файл сразу перестанет подключаться. Название и срок действия сохранятся.`,
+      `🔄 Перевыпустить файл «${config.displayName}»?\n\nНовый файл будет создан на другом сервере. Старый файл останется доступен ещё примерно 5 минут, чтобы Вы успели переключиться, а затем перестанет подключаться. Название и срок действия сохранятся.`,
       new InlineKeyboard()
-        .text("✅ Пересоздать", `rrc|${config.id}`)
+        .text("✅ Перевыпустить", `rrc|${config.id}`)
         .row()
         .text("❌ Отмена", `uc|${config.id}`)
     );
@@ -379,18 +379,18 @@ export function createBot(
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
-      return showAlert(ctx, "Просроченный конфиг нельзя пересоздать.");
+      return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
     if (operationLocks.has(config.id))
-      return showAlert(ctx, "Пересоздание уже выполняется.");
+      return showAlert(ctx, "Перевыпуск уже выполняется.");
 
     operationLocks.add(config.id);
-    await ctx.answerCallbackQuery({ text: "Пересоздаю конфиг…" });
+    await ctx.answerCallbackQuery({ text: "Перевыпускаю файл…" });
     try {
       const recreated = await configService.recreate(config);
       try {
         await edit(
           ctx,
-          `✅ Конфиг «${recreated.config.displayName}» пересоздан. Старый файл больше не подключится.`,
+          `✅ Файл «${recreated.config.displayName}» перевыпущен на другом сервере. Старый конфиг отключится примерно через 5 минут.`,
           new InlineKeyboard()
             .text("🔎 Открыть конфиг", `uc|${recreated.config.id}`)
             .row()
@@ -402,14 +402,14 @@ export function createBot(
             vpnFileName(recreated.config.clientName)
           ),
           {
-            caption: `🔐 Новый файл для «${recreated.config.displayName}». Действует до ${formatDate(recreated.config.expiresAt, appConfig.timezone)}.`,
+            caption: `🔐 Новый файл для «${recreated.config.displayName}». Действует до ${formatDate(recreated.config.expiresAt, appConfig.timezone)}. Переключитесь на него: старый конфиг отключится примерно через 5 минут.`,
           }
         );
       } catch (deliveryError) {
         logError(deliveryError);
         await ctx
           .reply(
-            "Конфиг пересоздан, но отправить файл не удалось. Откройте конфиг и нажмите «Получить файл».",
+            "Файл перевыпущен, но отправить его не удалось. Откройте конфиг и нажмите «Получить файл».",
             {
               reply_markup: new InlineKeyboard().text(
                 "🔎 Открыть конфиг",
@@ -422,7 +422,7 @@ export function createBot(
     } catch (error) {
       logError(error);
       await ctx.reply(
-        "Пересоздание не выполнено. Текущий конфиг оставлен без изменений. Попробуйте позднее или свяжитесь с администратором.",
+        "Перевыпуск не выполнен. Текущий конфиг оставлен без изменений. Попробуйте позднее или свяжитесь с администратором.",
         {
           reply_markup: new InlineKeyboard()
             .url("Связаться с администратором", appConfig.contactUrl)
@@ -923,7 +923,7 @@ async function showUserConfig(
     keyboard
       .text("📥 Получить файл", `dl|${config.id}`)
       .row()
-      .text("🔄 Пересоздать конфиг", `rr|${config.id}`)
+      .text("🔄 Перевыпустить файл", `rr|${config.id}`)
       .row();
   }
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");

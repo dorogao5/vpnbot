@@ -56,3 +56,12 @@ export interface TrafficSnapshot {
 export interface TrafficUsage extends ServerTraffic {
   totalBytes: number;
 }
+
+export interface PendingRevocationRecord {
+  id: number;
+  configId: string;
+  serverKey: ServerKey;
+  clientName: string;
+  scheduledAt: string;
+  attempts: number;
+}

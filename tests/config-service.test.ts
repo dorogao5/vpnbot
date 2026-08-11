@@ -133,7 +133,7 @@ describe("ConfigService", () => {
     );
   });
 
-  it("пересоздаёт конфиг на менее загруженном сервере и сохраняет данные", async () => {
+  it("перевыпускает конфиг на другом сервере и планирует отложенный отзыв", async () => {
     const user = await db.upsertUser({ telegramId: "105", firstName: "Сергей" });
     const original = await service.issue(user, "2027-03-01T20:59:59.999Z");
     await db.updateDisplayName(original.id, "Рабочий компьютер");
@@ -146,11 +146,22 @@ describe("ConfigService", () => {
     expect(recreated.config.expiresAt).toBe(original.expiresAt);
     expect(recreated.config.serverKey).toBe("old");
     expect(recreated.config.clientName).not.toBe(original.clientName);
-    expect(vpn.calls).toContain(`revoke:new:${original.clientName}`);
+    expect(vpn.calls).not.toContain(`revoke:new:${original.clientName}`);
     expect(recreated.file).toBeInstanceOf(Buffer);
+    const pending = await db.prisma.pendingRevocation.findMany();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      configId: original.id,
+      serverKey: "new",
+      clientName: original.clientName,
+      attempts: 0,
+    });
+    expect(pending[0]!.scheduledAt.getTime()).toBeGreaterThan(
+      Date.now() + 4 * 60 * 1000
+    );
   });
 
-  it("оставляет старый конфиг при ошибке его отзыва во время пересоздания", async () => {
+  it("оставляет старый конфиг при ошибке немедленного админского переноса", async () => {
     const user = await db.upsertUser({ telegramId: "106", firstName: "Елена" });
     await db.syncLegacyClients("old", ["legacy_recreate"]);
     const legacy = (await db.listUnassignedLegacyClients("old"))[0]!;
@@ -161,7 +172,9 @@ describe("ConfigService", () => {
     );
     vpn.failOldRevoke = true;
 
-    await expect(service.recreate(original)).rejects.toThrow("old unavailable");
+    await expect(service.moveToServer(original, "new")).rejects.toThrow(
+      "old unavailable"
+    );
 
     const restored = (await db.getConfig(original.id))!;
     expect(restored.clientName).toBe(original.clientName);

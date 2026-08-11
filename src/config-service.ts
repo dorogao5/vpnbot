@@ -19,6 +19,7 @@ export interface VpnOperations {
 
 const CLIENT_NAME_LENGTH = 12;
 const CLIENT_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
+const RECREATE_GRACE_PERIOD_MS = 5 * 60 * 1000;
 
 function randomClientName(): string {
   return Array.from(
@@ -197,8 +198,11 @@ export class ConfigService {
       throw new Error("Срок действия конфига истёк");
     }
 
-    const serverKey = await this.selectIssueServer();
-    return this.recreateOnServer(config, serverKey);
+    const serverKey: ServerKey = config.serverKey === "new" ? "old" : "new";
+    if (!this.vpn.isConfigured(serverKey)) {
+      throw new Error("Другой VPN-сервер не настроен");
+    }
+    return this.recreateOnServer(config, serverKey, true);
   }
 
   async moveToServer(
@@ -222,7 +226,8 @@ export class ConfigService {
 
   private async recreateOnServer(
     config: VpnConfigRecord,
-    serverKey: ServerKey
+    serverKey: ServerKey,
+    delayedRevocation = false
   ): Promise<{
     config: VpnConfigRecord;
     file: Buffer;
@@ -230,13 +235,26 @@ export class ConfigService {
     const { clientName: newClientName, file } =
       await this.createUniqueClient(serverKey);
     try {
-      await this.db.replaceClient(
-        config.id,
-        newClientName,
-        serverKey,
-        config.expiresAt,
-        config.hiddenAt
-      );
+      if (delayedRevocation) {
+        await this.db.replaceClientAndScheduleRevocation(
+          config.id,
+          newClientName,
+          serverKey,
+          config.expiresAt,
+          config.hiddenAt,
+          config.serverKey,
+          config.clientName,
+          new Date(Date.now() + RECREATE_GRACE_PERIOD_MS).toISOString()
+        );
+      } else {
+        await this.db.replaceClient(
+          config.id,
+          newClientName,
+          serverKey,
+          config.expiresAt,
+          config.hiddenAt
+        );
+      }
     } catch (error) {
       await this.vpn
         .revokeClient(serverKey, newClientName)
@@ -247,6 +265,13 @@ export class ConfigService {
           );
         });
       throw error;
+    }
+
+    if (delayedRevocation) {
+      return {
+        config: (await this.db.getConfig(config.id))!,
+        file,
+      };
     }
 
     try {

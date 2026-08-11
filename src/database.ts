@@ -4,6 +4,7 @@ import { PrismaClient } from "./generated/prisma/client.js";
 import type {
   CompletedTrafficSession,
   LegacyClientRecord,
+  PendingRevocationRecord,
   ServerKey,
   ServerTraffic,
   UserRecord,
@@ -234,6 +235,75 @@ export class AppDatabase {
         },
       });
       await tx.clientName.update({ where: { name: clientName }, data: { configId: id } });
+    });
+  }
+
+  async replaceClientAndScheduleRevocation(
+    id: string,
+    clientName: string,
+    serverKey: ServerKey,
+    expiresAt: string,
+    hiddenAt: string,
+    previousServerKey: ServerKey,
+    previousClientName: string,
+    scheduledAt: string
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.vpnConfig.update({
+        where: { id },
+        data: {
+          clientName,
+          serverKey,
+          isLegacy: false,
+          expiresAt: new Date(expiresAt),
+          hiddenAt: new Date(hiddenAt),
+          status: "active",
+          revokedAt: null,
+        },
+      });
+      await tx.clientName.update({
+        where: { name: clientName },
+        data: { configId: id },
+      });
+      await tx.pendingRevocation.create({
+        data: {
+          configId: id,
+          serverKey: previousServerKey,
+          clientName: previousClientName,
+          scheduledAt: new Date(scheduledAt),
+        },
+      });
+    });
+  }
+
+  async listDuePendingRevocations(
+    now = new Date()
+  ): Promise<PendingRevocationRecord[]> {
+    const rows = await this.prisma.pendingRevocation.findMany({
+      where: { scheduledAt: { lte: now } },
+      orderBy: { scheduledAt: "asc" },
+    });
+    return rows.map((row) => ({
+      id: row.id,
+      configId: row.configId,
+      serverKey: row.serverKey,
+      clientName: row.clientName,
+      scheduledAt: row.scheduledAt.toISOString(),
+      attempts: row.attempts,
+    }));
+  }
+
+  async completePendingRevocation(id: number): Promise<void> {
+    await this.prisma.pendingRevocation.delete({ where: { id } });
+  }
+
+  async markPendingRevocationFailed(id: number, error: string): Promise<void> {
+    await this.prisma.pendingRevocation.update({
+      where: { id },
+      data: {
+        attempts: { increment: 1 },
+        lastError: error.slice(0, 2000),
+      },
     });
   }
 

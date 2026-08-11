@@ -110,3 +110,18 @@ model TrafficEvent {
   @@index([serverKey, disconnectedAt])
   @@map("traffic_events")
 }
+
+model PendingRevocation {
+  id          Int       @id @default(autoincrement())
+  configId    String    @db.Uuid @map("config_id")
+  serverKey   ServerKey @map("server_key")
+  clientName  String    @db.VarChar(64) @map("client_name")
+  scheduledAt DateTime  @db.Timestamptz(3) @map("scheduled_at")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  @@unique([serverKey, clientName])
+  @@index([scheduledAt])
+  @@map("pending_revocations")
+}

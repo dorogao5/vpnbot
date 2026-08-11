@@ -12,6 +12,7 @@ export class BackgroundJobs {
   private readonly tasks: ScheduledTask[] = [];
   private remindersRunning = false;
   private revocationsRunning = false;
+  private delayedRevocationsRunning = false;
   private trafficRunning = false;
 
   constructor(
@@ -40,9 +41,15 @@ export class BackgroundJobs {
         timezone: this.config.timezone,
       })
     );
+    this.tasks.push(
+      cron.schedule("* * * * *", () => void this.revokeRecreatedClients(), {
+        timezone: this.config.timezone,
+      })
+    );
     void this.sendReminders();
     void this.revokeExpired();
     void this.syncTraffic();
+    void this.revokeRecreatedClients();
   }
 
   stop(): void {
@@ -157,6 +164,30 @@ export class BackgroundJobs {
       await this.traffic.syncAll();
     } finally {
       this.trafficRunning = false;
+    }
+  }
+
+  async revokeRecreatedClients(now = DateTime.now()): Promise<void> {
+    if (this.delayedRevocationsRunning) return;
+    this.delayedRevocationsRunning = true;
+    try {
+      for (const pending of await this.db.listDuePendingRevocations(now.toJSDate())) {
+        try {
+          await this.vpn.revokeClient(pending.serverKey, pending.clientName);
+          await this.db.completePendingRevocation(pending.id);
+        } catch (error) {
+          console.error(
+            `Не удалось отозвать ранее пересозданный клиент ${pending.clientName}`,
+            error
+          );
+          await this.db.markPendingRevocationFailed(
+            pending.id,
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      }
+    } finally {
+      this.delayedRevocationsRunning = false;
     }
   }
 }

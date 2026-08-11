@@ -81,6 +81,70 @@ describe("напоминания об окончании", () => {
   });
 });
 
+describe("отложенный отзыв перевыпущенных конфигов", () => {
+  it("повторяет неудачный отзыв до успешного выполнения", async () => {
+    const scheduledAt = new Date("2026-08-11T10:00:00.000Z");
+    await db.prisma.pendingRevocation.create({
+      data: {
+        configId: randomUUID(),
+        serverKey: "old",
+        clientName: "previous_client",
+        scheduledAt,
+      },
+    });
+    const revokeClient = vi
+      .fn<(_server: "new" | "old", _client: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("server unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const jobs = new BackgroundJobs(
+      {} as Bot,
+      db,
+      { revokeClient } as unknown as OpenVpnGateway,
+      appConfig,
+      {} as TrafficService
+    );
+    const now = DateTime.fromJSDate(scheduledAt).plus({ minutes: 1 });
+
+    await jobs.revokeRecreatedClients(now);
+    const failed = await db.prisma.pendingRevocation.findFirst();
+    expect(failed).toMatchObject({ attempts: 1, lastError: "server unavailable" });
+
+    await jobs.revokeRecreatedClients(now);
+    expect(revokeClient).toHaveBeenCalledTimes(2);
+    expect(revokeClient).toHaveBeenCalledWith("old", "previous_client");
+    expect(await db.prisma.pendingRevocation.count()).toBe(0);
+    errorLog.mockRestore();
+  });
+
+  it("не отзывает клиент до назначенного времени", async () => {
+    const scheduledAt = new Date("2026-08-11T10:05:00.000Z");
+    await db.prisma.pendingRevocation.create({
+      data: {
+        configId: randomUUID(),
+        serverKey: "new",
+        clientName: "grace_client",
+        scheduledAt,
+      },
+    });
+    const revokeClient = vi.fn(async () => undefined);
+    const jobs = new BackgroundJobs(
+      {} as Bot,
+      db,
+      { revokeClient } as unknown as OpenVpnGateway,
+      appConfig,
+      {} as TrafficService
+    );
+
+    await jobs.revokeRecreatedClients(
+      DateTime.fromJSDate(scheduledAt).minus({ seconds: 1 })
+    );
+
+    expect(revokeClient).not.toHaveBeenCalled();
+    expect(await db.prisma.pendingRevocation.count()).toBe(1);
+  });
+});
+
 function reminderConfig(
   userId: number,
   displayName: string,
