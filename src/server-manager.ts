@@ -264,6 +264,7 @@ fi
 BOT_KEY_PATH="\\$SSH_DIR/vpnbot_ed25519"
 rm -f "\\$BOT_KEY_PATH" "\\$BOT_KEY_PATH.pub"
 ssh-keygen -q -t ed25519 -N "" -C "vpnbot-SRV_KEY_PLACEHOLDER" -f "\\$BOT_KEY_PATH"
+BOT_PUB_LINE="\\$(cat "\\$BOT_KEY_PATH.pub")"
 
 if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
   if [[ ! -x /etc/openvpn/server/easy-rsa/easyrsa ]]; then
@@ -291,7 +292,8 @@ systemctl restart openvpn-server@server.service
 
 id -u vpn-bot >/dev/null 2>&1 || useradd -m -s /bin/sh vpn-bot
 install -d -m 0700 -o vpn-bot -g vpn-bot /home/vpn-bot/.ssh
-echo '${keyLine}' > /home/vpn-bot/.ssh/authorized_keys
+echo "\\$BOT_PUB_LINE" > /home/vpn-bot/.ssh/authorized_keys
+echo '${keyLine}' >> /home/vpn-bot/.ssh/authorized_keys
 chmod 0600 /home/vpn-bot/.ssh/authorized_keys
 chown vpn-bot:vpn-bot /home/vpn-bot/.ssh/authorized_keys
 
