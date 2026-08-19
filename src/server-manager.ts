@@ -159,7 +159,8 @@ export class ServerManager {
 
     let script: string;
     try {
-      script = renderBootstrapScript(this.config.bootstrapPublicKey!);
+      script = renderBootstrapScript(this.config.bootstrapPublicKey!)
+        .replaceAll("\\$", "$");
     } catch (error) {
       await fail(error);
       return;
@@ -246,8 +247,6 @@ function renderBootstrapScript(publicKey: string): string {
   return `set -Eeuo pipefail
 
 SRV_KEY="SRV_KEY_PLACEHOLDER"
-
-SRV_KEY="\\$1"
 
 export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
