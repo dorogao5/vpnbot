@@ -1,5 +1,6 @@
-export type ServerKey = "new" | "old";
+export type ServerKey = string;
 export type ConfigStatus = "active" | "expired" | "revoked" | "error";
+export type ServerStatus = "ready" | "pending" | "error";
 
 export interface UserRecord {
   id: number;
@@ -31,6 +32,23 @@ export interface LegacyClientRecord {
   clientName: string;
   assignedConfigId: string | null;
   discoveredAt: string;
+}
+
+export interface VpnServerRecord {
+  id: number;
+  key: ServerKey;
+  name: string;
+  host: string;
+  port: number;
+  sshUser: string;
+  sshPrivateKey: string;
+  hostFingerprint: string;
+  status: ServerStatus;
+  enabled: boolean;
+  isBuiltin: boolean;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ServerTraffic {

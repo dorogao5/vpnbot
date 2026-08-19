@@ -1,23 +1,30 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ServerResolver } from "../src/config-service.js";
 import { AppDatabase } from "../src/database.js";
 import type {
   CompletedTrafficSession,
-  ServerKey,
   TrafficSnapshot,
   VpnConfigRecord,
 } from "../src/domain.js";
-import { OpenVpnGateway } from "../src/openvpn.js";
+import type { OpenVpnGateway, VpnServerTarget } from "../src/openvpn.js";
 import { TrafficService } from "../src/traffic-service.js";
 import { createCleanDatabase } from "./database-fixture.js";
+
+const NEW_TARGET: VpnServerTarget = {
+  key: "new",
+  name: "Новый сервер",
+  host: "new.test",
+  port: 22,
+  username: "vpn-bot",
+  privateKey: Buffer.from("key"),
+  hostFingerprint: "SHA256:test",
+  helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
+};
 
 class FakeTrafficGateway {
   snapshot: TrafficSnapshot = { active: [], completed: [] };
   activeCalls = 0;
-
-  isConfigured(serverKey: ServerKey): boolean {
-    return serverKey === "new";
-  }
 
   async trafficSessions(): Promise<TrafficSnapshot> {
     return this.snapshot;
@@ -26,6 +33,16 @@ class FakeTrafficGateway {
   async activeSessions(): Promise<TrafficSnapshot["active"]> {
     this.activeCalls += 1;
     return this.snapshot.active;
+  }
+}
+
+class FakeResolver implements ServerResolver {
+  async resolveTarget(serverKey: string): Promise<VpnServerTarget | null> {
+    return serverKey === "new" ? NEW_TARGET : null;
+  }
+
+  async usableTargets(): Promise<VpnServerTarget[]> {
+    return [NEW_TARGET];
   }
 }
 
@@ -39,7 +56,8 @@ beforeEach(async () => {
   gateway = new FakeTrafficGateway();
   service = new TrafficService(
     db,
-    gateway as unknown as OpenVpnGateway
+    gateway as unknown as OpenVpnGateway,
+    new FakeResolver()
   );
   const user = await db.upsertUser({ telegramId: "500", firstName: "Иван" });
   const now = new Date().toISOString();
@@ -122,8 +140,8 @@ describe("TrafficService", () => {
 
     const totals = await service.all();
     expect(totals.total.totalBytes).toBe(3072);
-    expect(totals.servers.new.activeConnections).toBe(1);
-    expect(totals.servers.old.liveAvailable).toBe(false);
+    expect(totals.servers.new!.activeConnections).toBe(1);
+    expect(totals.servers.old).toBeUndefined();
   });
 
   it("показывает активные подключения даже при ошибке импорта истории", async () => {
@@ -144,8 +162,8 @@ describe("TrafficService", () => {
     await service.syncAll();
     const totals = await service.all();
 
-    expect(totals.servers.new.liveAvailable).toBe(true);
-    expect(totals.servers.new.activeConnections).toBe(1);
+    expect(totals.servers.new!.liveAvailable).toBe(true);
+    expect(totals.servers.new!.activeConnections).toBe(1);
     log.mockRestore();
   });
 

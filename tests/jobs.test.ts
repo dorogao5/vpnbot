@@ -6,7 +6,8 @@ import type { AppConfig } from "../src/config.js";
 import { AppDatabase } from "../src/database.js";
 import type { VpnConfigRecord } from "../src/domain.js";
 import { BackgroundJobs } from "../src/jobs.js";
-import type { OpenVpnGateway } from "../src/openvpn.js";
+import type { ServerResolver } from "../src/config-service.js";
+import type { OpenVpnGateway, VpnServerTarget } from "../src/openvpn.js";
 import { expiryFromDate, hiddenAtFromExpiry } from "../src/time.js";
 import type { TrafficService } from "../src/traffic-service.js";
 import { createCleanDatabase } from "./database-fixture.js";
@@ -18,7 +19,29 @@ const appConfig: AppConfig = {
   databaseUrl: "test",
   timezone: "Europe/Moscow",
   reminderHour: 10,
-  servers: {},
+  helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
+  bootstrapPublicKey: undefined,
+  envServers: {},
+};
+
+const TEST_TARGET: VpnServerTarget = {
+  key: "old",
+  name: "Старый сервер",
+  host: "old.test",
+  port: 22,
+  username: "vpn-bot",
+  privateKey: Buffer.from("key"),
+  hostFingerprint: "SHA256:test",
+  helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
+};
+
+const testResolver: ServerResolver = {
+  async resolveTarget() {
+    return TEST_TARGET;
+  },
+  async usableTargets() {
+    return [TEST_TARGET];
+  },
 };
 
 let db: AppDatabase;
@@ -55,7 +78,8 @@ describe("напоминания об окончании", () => {
       db,
       {} as OpenVpnGateway,
       appConfig,
-      {} as TrafficService
+      {} as TrafficService,
+      testResolver
     );
     const now = DateTime.fromISO("2026-07-29T10:00:00", {
       zone: appConfig.timezone,
@@ -93,7 +117,7 @@ describe("отложенный отзыв перевыпущенных конф�
       },
     });
     const revokeClient = vi
-      .fn<(_server: "new" | "old", _client: string) => Promise<void>>()
+      .fn<(_server: VpnServerTarget, _client: string) => Promise<void>>()
       .mockRejectedValueOnce(new Error("server unavailable"))
       .mockResolvedValueOnce(undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -102,7 +126,8 @@ describe("отложенный отзыв перевыпущенных конф�
       db,
       { revokeClient } as unknown as OpenVpnGateway,
       appConfig,
-      {} as TrafficService
+      {} as TrafficService,
+      testResolver
     );
     const now = DateTime.fromJSDate(scheduledAt).plus({ minutes: 1 });
 
@@ -112,7 +137,7 @@ describe("отложенный отзыв перевыпущенных конф�
 
     await jobs.revokeRecreatedClients(now);
     expect(revokeClient).toHaveBeenCalledTimes(2);
-    expect(revokeClient).toHaveBeenCalledWith("old", "previous_client");
+    expect(revokeClient).toHaveBeenCalledWith(TEST_TARGET, "previous_client");
     expect(await db.prisma.pendingRevocation.count()).toBe(0);
     errorLog.mockRestore();
   });
@@ -133,7 +158,8 @@ describe("отложенный отзыв перевыпущенных конф�
       db,
       { revokeClient } as unknown as OpenVpnGateway,
       appConfig,
-      {} as TrafficService
+      {} as TrafficService,
+      testResolver
     );
 
     await jobs.revokeRecreatedClients(

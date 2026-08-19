@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import type { ServerKey } from "./domain.js";
 
 const optionalString = z
   .string()
@@ -18,6 +17,7 @@ const schema = z.object({
   VPN_HELPER_COMMAND: z
     .string()
     .default("sudo /usr/local/sbin/openvpn-bot-helper"),
+  VPN_BOOTSTRAP_PUBLIC_KEY_PATH: optionalString,
   NEW_VPN_NAME: z.string().default("Новый сервер"),
   NEW_VPN_HOST: optionalString,
   NEW_VPN_PORT: z.coerce.number().int().min(1).max(65535).default(22),
@@ -33,7 +33,7 @@ const schema = z.object({
 });
 
 export interface VpnServerConfig {
-  key: ServerKey;
+  key: string;
   name: string;
   host: string;
   port: number;
@@ -50,11 +50,13 @@ export interface AppConfig {
   databaseUrl: string;
   timezone: string;
   reminderHour: number;
-  servers: Partial<Record<ServerKey, VpnServerConfig>>;
+  helperCommand: string;
+  bootstrapPublicKey: string | undefined;
+  envServers: Partial<Record<"new" | "old", VpnServerConfig>>;
 }
 
 function serverFromEnv(
-  key: ServerKey,
+  key: "new" | "old",
   name: string,
   host: string | undefined,
   port: number,
@@ -112,7 +114,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     databaseUrl: parsed.DATABASE_URL,
     timezone: parsed.TIMEZONE,
     reminderHour: parsed.REMINDER_HOUR,
-    servers: {
+    helperCommand: parsed.VPN_HELPER_COMMAND,
+    bootstrapPublicKey: parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH
+      ? readFileSync(parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH, "utf8").trim()
+      : undefined,
+    envServers: {
       ...(newServer ? { new: newServer } : {}),
       ...(oldServer ? { old: oldServer } : {}),
     },

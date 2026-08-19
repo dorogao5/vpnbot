@@ -8,11 +8,6 @@ datasource db {
   provider = "postgresql"
 }
 
-enum ServerKey {
-  new
-  old
-}
-
 enum ConfigStatus {
   active
   expired
@@ -38,7 +33,7 @@ model VpnConfig {
   userId         Int            @map("user_id")
   displayName    String         @map("display_name")
   clientName     String         @map("client_name")
-  serverKey      ServerKey      @map("server_key")
+  serverKey      String         @db.VarChar(32) @map("server_key")
   expiresAt      DateTime       @db.Timestamptz(3) @map("expires_at")
   status         ConfigStatus   @default(active)
   isLegacy       Boolean        @default(false) @map("is_legacy")
@@ -72,7 +67,7 @@ model Notification {
 
 model LegacyClient {
   id               Int        @id @default(autoincrement())
-  serverKey        ServerKey  @map("server_key")
+  serverKey        String     @db.VarChar(32) @map("server_key")
   clientName       String     @map("client_name")
   assignedConfigId String?    @db.Uuid @map("assigned_config_id")
   discoveredAt     DateTime   @default(now()) @db.Timestamptz(3) @map("discovered_at")
@@ -94,7 +89,7 @@ model ClientName {
 }
 
 model TrafficEvent {
-  serverKey     ServerKey @map("server_key")
+  serverKey     String    @db.VarChar(32) @map("server_key")
   eventId       String    @db.VarChar(160) @map("event_id")
   configId      String?   @db.Uuid @map("config_id")
   clientName    String    @db.VarChar(64) @map("client_name")
@@ -114,7 +109,7 @@ model TrafficEvent {
 model PendingRevocation {
   id          Int       @id @default(autoincrement())
   configId    String    @db.Uuid @map("config_id")
-  serverKey   ServerKey @map("server_key")
+  serverKey   String    @db.VarChar(32) @map("server_key")
   clientName  String    @db.VarChar(64) @map("client_name")
   scheduledAt DateTime  @db.Timestamptz(3) @map("scheduled_at")
   attempts    Int       @default(0)
@@ -124,4 +119,29 @@ model PendingRevocation {
   @@unique([serverKey, clientName])
   @@index([scheduledAt])
   @@map("pending_revocations")
+}
+
+enum ServerStatus {
+  ready
+  pending
+  error
+}
+
+model VpnServer {
+  id              Int          @id @default(autoincrement())
+  key             String       @unique @db.VarChar(32)
+  name            String
+  host            String
+  port            Int          @default(22)
+  sshUser         String       @default("vpn-bot") @map("ssh_user")
+  sshPrivateKey   String       @map("ssh_private_key")
+  hostFingerprint String       @map("host_fingerprint")
+  status          ServerStatus @default(ready)
+  enabled         Boolean      @default(true)
+  isBuiltin       Boolean      @default(false) @map("is_builtin")
+  lastError       String?      @map("last_error")
+  createdAt       DateTime     @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(3) @map("updated_at")
+
+  @@map("vpn_servers")
 }
