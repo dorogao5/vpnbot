@@ -302,9 +302,9 @@ visudo -cf /etc/sudoers.d/vpn-bot >/dev/null
 FP="\\$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 | awk '{print \\$2}')"
 echo "===VPNBOT-RESULT==="
 echo "fingerprint=\\$FP"
-echo "-----BEGIN PRIVATE KEY-----"
+echo "-----BEGIN OPENSSH PRIVATE KEY-----"
 cat "\\$BOT_KEY_PATH"
-echo "-----END PRIVATE KEY-----"
+echo "-----END OPENSSH PRIVATE KEY-----"
 `;
 }
 
@@ -322,12 +322,12 @@ function parseBootstrapOutput(output: string): {
   const result = output.slice(marker);
   const fingerprint = result.match(/fingerprint=(SHA256:\S+)/)?.[1];
   const keyMatch = result.match(
-    /-----BEGIN PRIVATE KEY-----\s*([\s\S]*?)\s*-----END PRIVATE KEY-----/
+    /-----BEGIN OPENSSH PRIVATE KEY-----\s*([\s\S]*?)\s*-----END OPENSSH PRIVATE KEY-----/
   );
   if (!fingerprint || !keyMatch?.[1])
     throw new Error("Не удалось разобрать ключ и fingerprint нового сервера");
   return {
     fingerprint,
-    privateKey: `-----BEGIN PRIVATE KEY-----\n${keyMatch[1].trim()}\n-----END PRIVATE KEY-----\n`,
+    privateKey: `-----BEGIN OPENSSH PRIVATE KEY-----\n${keyMatch[1].trim()}\n-----END OPENSSH PRIVATE KEY-----\n`,
   };
 }
