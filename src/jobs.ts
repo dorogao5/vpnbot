@@ -5,6 +5,7 @@ import type { AppConfig } from "./config.js";
 import { AppDatabase } from "./database.js";
 import type { UserRecord, VpnConfigRecord } from "./domain.js";
 import { OpenVpnGateway } from "./openvpn.js";
+import type { ServerResolver } from "./config-service.js";
 import { daysUntilExpiry, formatDate, isRevocationDue } from "./time.js";
 import { TrafficService } from "./traffic-service.js";
 
@@ -20,7 +21,8 @@ export class BackgroundJobs {
     private readonly db: AppDatabase,
     private readonly vpn: OpenVpnGateway,
     private readonly config: AppConfig,
-    private readonly traffic: TrafficService
+    private readonly traffic: TrafficService,
+    private readonly servers: ServerResolver
   ) {}
 
   start(): void {
@@ -143,7 +145,9 @@ export class BackgroundJobs {
       for (const config of await this.db.listActiveConfigs()) {
         if (!isRevocationDue(config.expiresAt, now)) continue;
         try {
-          await this.vpn.revokeClient(config.serverKey, config.clientName);
+          const target = await this.servers.resolveTarget(config.serverKey);
+          if (!target) throw new Error(`Сервер ${config.serverKey} не подключён`);
+          await this.vpn.revokeClient(target, config.clientName);
           await this.db.markExpired(config.id);
         } catch (error) {
           console.error(
@@ -173,7 +177,10 @@ export class BackgroundJobs {
     try {
       for (const pending of await this.db.listDuePendingRevocations(now.toJSDate())) {
         try {
-          await this.vpn.revokeClient(pending.serverKey, pending.clientName);
+          const target = await this.servers.resolveTarget(pending.serverKey);
+          if (!target)
+            throw new Error(`Сервер ${pending.serverKey} не подключён`);
+          await this.vpn.revokeClient(target, pending.clientName);
           await this.db.completePendingRevocation(pending.id);
         } catch (error) {
           console.error(

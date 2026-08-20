@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-import { Client } from "ssh2";
 import type {
   ActiveTrafficSession,
   CompletedTrafficSession,
@@ -8,6 +6,7 @@ import type {
   TrafficSnapshot,
 } from "./domain.js";
 import type { VpnServerConfig } from "./config.js";
+import { runSshCommand } from "./ssh-run.js";
 
 const CLIENT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -16,49 +15,57 @@ function verifyClientName(name: string): void {
     throw new Error("Недопустимое техническое имя OpenVPN-клиента");
 }
 
-function fingerprint(key: Buffer): string {
-  return `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+export interface VpnServerTarget {
+  key: ServerKey;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  privateKey: string | Buffer;
+  hostFingerprint: string;
+  helperCommand: string;
 }
 
 export class OpenVpnGateway {
   constructor(
-    private readonly servers: Partial<Record<ServerKey, VpnServerConfig>>
+    private readonly envServers: Partial<Record<"new" | "old", VpnServerConfig>>,
+    private readonly fallbackName: (serverKey: ServerKey) => string
   ) {}
 
   isConfigured(serverKey: ServerKey): boolean {
-    return Boolean(this.servers[serverKey]);
+    return serverKey in this.envServers;
+  }
+
+  isBuiltin(serverKey: ServerKey): boolean {
+    return serverKey === "new" || serverKey === "old";
   }
 
   serverName(serverKey: ServerKey): string {
-    return (
-      this.servers[serverKey]?.name ??
-      (serverKey === "new" ? "Новый сервер" : "Старый сервер")
-    );
+    return this.envServers[serverKey as "new" | "old"]?.name
+      ?? this.fallbackName(serverKey);
   }
 
-  async createClient(
-    serverKey: ServerKey,
-    clientName: string
-  ): Promise<Buffer> {
+  envTarget(serverKey: ServerKey): VpnServerTarget | undefined {
+    return this.envServers[serverKey as "new" | "old"];
+  }
+
+  async createClient(server: VpnServerTarget, clientName: string): Promise<Buffer> {
     verifyClientName(clientName);
-    return this.execute(serverKey, ["create", clientName]);
+    return this.execute(server, ["create", clientName]);
   }
 
-  async downloadClient(
-    serverKey: ServerKey,
-    clientName: string
-  ): Promise<Buffer> {
+  async downloadClient(server: VpnServerTarget, clientName: string): Promise<Buffer> {
     verifyClientName(clientName);
-    return this.execute(serverKey, ["download", clientName]);
+    return this.execute(server, ["download", clientName]);
   }
 
-  async revokeClient(serverKey: ServerKey, clientName: string): Promise<void> {
+  async revokeClient(server: VpnServerTarget, clientName: string): Promise<void> {
     verifyClientName(clientName);
-    await this.execute(serverKey, ["revoke", clientName]);
+    await this.execute(server, ["revoke", clientName]);
   }
 
-  async listClients(serverKey: ServerKey): Promise<string[]> {
-    const output = await this.execute(serverKey, ["list"]);
+  async listClients(server: VpnServerTarget): Promise<string[]> {
+    const output = await this.execute(server, ["list"]);
     return output
       .toString("utf8")
       .split(/\r?\n/)
@@ -66,8 +73,8 @@ export class OpenVpnGateway {
       .filter(Boolean);
   }
 
-  async traffic(serverKey: ServerKey): Promise<ServerTraffic> {
-    const output = await this.execute(serverKey, ["stats"]);
+  async traffic(server: VpnServerTarget): Promise<ServerTraffic> {
+    const output = await this.execute(server, ["stats"]);
     const parsed = JSON.parse(
       output.toString("utf8")
     ) as Partial<ServerTraffic>;
@@ -83,81 +90,26 @@ export class OpenVpnGateway {
     };
   }
 
-  async trafficSessions(serverKey: ServerKey): Promise<TrafficSnapshot> {
-    const output = await this.execute(serverKey, ["traffic-sessions"]);
+  async trafficSessions(server: VpnServerTarget): Promise<TrafficSnapshot> {
+    const output = await this.execute(server, ["traffic-sessions"]);
     return parseTrafficSnapshot(output);
   }
 
-  async activeSessions(serverKey: ServerKey): Promise<ActiveTrafficSession[]> {
-    const output = await this.execute(serverKey, ["active-sessions"]);
+  async activeSessions(server: VpnServerTarget): Promise<ActiveTrafficSession[]> {
+    const output = await this.execute(server, ["active-sessions"]);
     return parseTrafficSnapshot(output).active;
   }
 
-  private async execute(serverKey: ServerKey, args: string[]): Promise<Buffer> {
-    const server = this.servers[serverKey];
-    if (!server)
-      throw new Error(`${this.serverName(serverKey)} пока не настроен`);
+  private async execute(server: VpnServerTarget, args: string[]): Promise<Buffer> {
     const command = [server.helperCommand, ...args].join(" ");
-
-    return new Promise<Buffer>((resolve, reject) => {
-      const connection = new Client();
-      let settled = false;
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          connection.end();
-          reject(new Error(`Тайм-аут подключения к серверу «${server.name}»`));
-        }
-      }, 30_000);
-
-      const finish = (callback: () => void): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        connection.end();
-        callback();
-      };
-
-      connection.on("ready", () => {
-        connection.exec(command, (error, stream) => {
-          if (error) {
-            finish(() => reject(error));
-            return;
-          }
-
-          const stdout: Buffer[] = [];
-          const stderr: Buffer[] = [];
-          stream.on("data", (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
-          stream.stderr.on("data", (chunk: Buffer) =>
-            stderr.push(Buffer.from(chunk))
-          );
-          stream.on("close", (code: number | undefined) => {
-            const errorText = Buffer.concat(stderr).toString("utf8").trim();
-            if (code === 0) {
-              finish(() => resolve(Buffer.concat(stdout)));
-            } else {
-              finish(() =>
-                reject(
-                  new Error(
-                    errorText || `VPN helper завершился с кодом ${code ?? "?"}`
-                  )
-                )
-              );
-            }
-          });
-        });
-      });
-      connection.on("error", (error) => finish(() => reject(error)));
-      connection.connect({
-        host: server.host,
-        port: server.port,
-        username: server.username,
-        privateKey: server.privateKey,
-        readyTimeout: 20_000,
-        keepaliveInterval: 5_000,
-        hostVerifier: (key: Buffer) =>
-          fingerprint(key) === server.hostFingerprint,
-      });
+    return runSshCommand({
+      host: server.host,
+      port: server.port,
+      username: server.username,
+      privateKey: server.privateKey,
+      hostFingerprint: server.hostFingerprint,
+      command,
+      timeoutMs: 30_000,
     });
   }
 }

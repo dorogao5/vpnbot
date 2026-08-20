@@ -1,5 +1,10 @@
 import { PrismaPg } from "@prisma/adapter-pg";
-import type { User, VpnConfig, LegacyClient } from "./generated/prisma/client.js";
+import type {
+  User,
+  VpnConfig,
+  LegacyClient,
+  VpnServer,
+} from "./generated/prisma/client.js";
 import { PrismaClient } from "./generated/prisma/client.js";
 import type {
   CompletedTrafficSession,
@@ -9,6 +14,7 @@ import type {
   ServerTraffic,
   UserRecord,
   VpnConfigRecord,
+  VpnServerRecord,
 } from "./domain.js";
 
 function mapUser(row: User): UserRecord {
@@ -46,6 +52,25 @@ function mapLegacy(row: LegacyClient): LegacyClientRecord {
     clientName: row.clientName,
     assignedConfigId: row.assignedConfigId,
     discoveredAt: row.discoveredAt.toISOString(),
+  };
+}
+
+function mapServer(row: VpnServer): VpnServerRecord {
+  return {
+    id: row.id,
+    key: row.key,
+    name: row.name,
+    host: row.host,
+    port: row.port,
+    sshUser: row.sshUser,
+    sshPrivateKey: row.sshPrivateKey,
+    hostFingerprint: row.hostFingerprint,
+    status: row.status,
+    enabled: row.enabled,
+    isBuiltin: row.isBuiltin,
+    lastError: row.lastError,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
   };
 }
 
@@ -369,7 +394,7 @@ export class AppDatabase {
       UPDATE "traffic_events" AS events
       SET "config_id" = names."config_id"
       FROM "client_names" AS names
-      WHERE events."server_key" = CAST(${serverKey} AS "ServerKey")
+      WHERE events."server_key" = ${serverKey}
         AND events."config_id" IS NULL
         AND names."name" = events."client_name"
         AND names."config_id" IS NOT NULL
@@ -401,15 +426,30 @@ export class AppDatabase {
       by: ["serverKey"],
       _sum: { uploadBytes: true, downloadBytes: true },
     });
-    const result: Record<ServerKey, ServerTraffic> = {
-      new: { uploadBytes: 0, downloadBytes: 0 },
-      old: { uploadBytes: 0, downloadBytes: 0 },
-    };
+    const result: Record<ServerKey, ServerTraffic> = {};
     for (const row of rows) {
       result[row.serverKey] = {
         uploadBytes: Number(row._sum.uploadBytes ?? 0n),
         downloadBytes: Number(row._sum.downloadBytes ?? 0n),
       };
+    }
+    return result;
+  }
+
+  async trafficByConfigIds(configIds: string[]): Promise<Map<string, ServerTraffic>> {
+    const result = new Map<string, ServerTraffic>();
+    if (configIds.length === 0) return result;
+    const rows = await this.prisma.trafficEvent.groupBy({
+      by: ["configId"],
+      where: { configId: { in: configIds } },
+      _sum: { uploadBytes: true, downloadBytes: true },
+    });
+    for (const row of rows) {
+      if (!row.configId) continue;
+      result.set(row.configId, {
+        uploadBytes: Number(row._sum.uploadBytes ?? 0n),
+        downloadBytes: Number(row._sum.downloadBytes ?? 0n),
+      });
     }
     return result;
   }
@@ -487,17 +527,133 @@ export class AppDatabase {
     return await this.prisma.vpnConfig.count({ where: { userId } }) + 1;
   }
 
-  async stats(): Promise<{ users: number; active: number; expired: number; old: number; new: number }> {
+  async stats(): Promise<{
+    users: number;
+    active: number;
+    expired: number;
+    perServer: Record<ServerKey, number>;
+  }> {
     const now = new Date();
-    const [users, active, expired, old, newCount] = await Promise.all([
+    const [users, active, expired, grouped] = await Promise.all([
       this.prisma.user.count(),
       this.prisma.vpnConfig.count({ where: { status: "active", expiresAt: { gt: now } } }),
       this.prisma.vpnConfig.count({
         where: { status: { not: "revoked" }, expiresAt: { lte: now }, hiddenAt: { gt: now } },
       }),
-      this.prisma.vpnConfig.count({ where: { status: { not: "revoked" }, serverKey: "old" } }),
-      this.prisma.vpnConfig.count({ where: { status: { not: "revoked" }, serverKey: "new" } }),
+      this.prisma.vpnConfig.groupBy({
+        by: ["serverKey"],
+        where: { status: { not: "revoked" } },
+        _count: { _all: true },
+      }),
     ]);
-    return { users, active, expired, old, new: newCount };
+    const perServer: Record<ServerKey, number> = {};
+    for (const row of grouped) perServer[row.serverKey] = row._count._all;
+    return { users, active, expired, perServer };
+  }
+
+  async listServers(): Promise<VpnServerRecord[]> {
+    const rows = await this.prisma.vpnServer.findMany({
+      orderBy: [{ isBuiltin: "desc" }, { id: "asc" }],
+    });
+    return rows.map(mapServer);
+  }
+
+  async getServerByKey(key: string): Promise<VpnServerRecord | null> {
+    const row = await this.prisma.vpnServer.findUnique({ where: { key } });
+    return row ? mapServer(row) : null;
+  }
+
+  async getServerByHost(host: string): Promise<VpnServerRecord | null> {
+    const row = await this.prisma.vpnServer.findFirst({ where: { host } });
+    return row ? mapServer(row) : null;
+  }
+
+  async upsertBuiltinServer(input: {
+    key: string;
+    name: string;
+    host: string;
+    port: number;
+    sshUser: string;
+    sshPrivateKey: string;
+    hostFingerprint: string;
+  }): Promise<VpnServerRecord> {
+    const row = await this.prisma.vpnServer.upsert({
+      where: { key: input.key },
+      create: {
+        key: input.key,
+        name: input.name,
+        host: input.host,
+        port: input.port,
+        sshUser: input.sshUser,
+        sshPrivateKey: input.sshPrivateKey,
+        hostFingerprint: input.hostFingerprint,
+        status: "ready",
+        enabled: true,
+        isBuiltin: true,
+      },
+      update: {
+        name: input.name,
+        host: input.host,
+        port: input.port,
+        sshUser: input.sshUser,
+        sshPrivateKey: input.sshPrivateKey,
+        hostFingerprint: input.hostFingerprint,
+      },
+    });
+    return mapServer(row);
+  }
+
+  async createServerPlaceholder(input: {
+    key: string;
+    name: string;
+    host: string;
+    port: number;
+    sshUser: string;
+    sshPrivateKey: string;
+    hostFingerprint: string;
+  }): Promise<VpnServerRecord> {
+    const row = await this.prisma.vpnServer.create({
+      data: {
+        key: input.key,
+        name: input.name,
+        host: input.host,
+        port: input.port,
+        sshUser: input.sshUser,
+        sshPrivateKey: input.sshPrivateKey,
+        hostFingerprint: input.hostFingerprint,
+        status: "pending",
+        enabled: false,
+        isBuiltin: false,
+      },
+    });
+    return mapServer(row);
+  }
+
+  async updateServer(key: string, data: {
+    name?: string;
+    host?: string;
+    port?: number;
+    sshUser?: string;
+    sshPrivateKey?: string;
+    hostFingerprint?: string;
+    enabled?: boolean;
+    status?: "ready" | "pending" | "error";
+    lastError?: string | null;
+  }): Promise<VpnServerRecord> {
+    const row = await this.prisma.vpnServer.update({ where: { key }, data });
+    return mapServer(row);
+  }
+
+  async maxDynamicServerId(): Promise<number> {
+    const rows = await this.prisma.vpnServer.findMany({
+      where: { key: { startsWith: "srv_" } },
+      select: { key: true },
+    });
+    let max = 0;
+    for (const { key } of rows) {
+      const value = Number(key.slice(4));
+      if (Number.isSafeInteger(value) && value > max) max = value;
+    }
+    return max;
   }
 }

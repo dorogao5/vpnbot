@@ -13,6 +13,7 @@ export async function createCleanDatabase(): Promise<AppDatabase> {
     db.prisma.clientName.deleteMany(),
     db.prisma.vpnConfig.deleteMany(),
     db.prisma.user.deleteMany(),
+    db.prisma.vpnServer.deleteMany(),
   ]);
   return db;
 }

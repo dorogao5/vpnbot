@@ -7,10 +7,12 @@ import { ConfigService } from "./config-service.js";
 import { AppDatabase } from "./database.js";
 import type {
   LegacyClientRecord,
+  ServerKey,
   UserRecord,
   VpnConfigRecord,
 } from "./domain.js";
-import { OpenVpnGateway } from "./openvpn.js";
+import type { VpnServerTarget } from "./openvpn.js";
+import { ServerManager, type ServerWithTarget } from "./server-manager.js";
 import { vpnFileName } from "./file-name.js";
 import {
   TrafficService,
@@ -35,7 +37,9 @@ type PendingInput =
   | { kind: "search" }
   | { kind: "rename"; configId: string }
   | { kind: "date"; target: DateTarget }
-  | { kind: "broadcast" };
+  | { kind: "broadcast" }
+  | { kind: "server-add" }
+  | { kind: "server-rename"; serverKey: ServerKey };
 
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
@@ -48,9 +52,9 @@ export interface BotApplication {
 export function createBot(
   appConfig: AppConfig,
   db: AppDatabase,
-  vpn: OpenVpnGateway,
   configService: ConfigService,
-  trafficService: TrafficService
+  trafficService: TrafficService,
+  serverManager: ServerManager
 ): BotApplication {
   const bot = new Bot(appConfig.botToken);
   const broadcastDrafts = new Map<
@@ -58,6 +62,8 @@ export function createBot(
     { text: string; entities?: MessageEntity[] }
   >();
   let broadcastRunning = false;
+
+  serverManager.onBootstrapFinished = (text) => notifyAdmin(bot, appConfig, text);
 
   bot.catch((error) => {
     console.error("Необработанная ошибка Telegram-бота", error.error);
@@ -188,7 +194,79 @@ export function createBot(
       return;
     }
 
+    if (pending.kind === "server-add") {
+      if (!isAdmin(ctx, appConfig)) return;
+      const parts = ctx.message.text
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const [host = "", portText = "22", password = "", name = ""] = parts;
+      const port = Number(portText);
+      try {
+        const server = await serverManager.addServer({
+          host,
+          port,
+          rootPassword: password,
+          name,
+        });
+        await ctx.reply(
+          `⏳ Началась настройка сервера «${server.name}» (${server.host}). Это займёт несколько минут — по окончании пришлю уведомление.`,
+          {
+            reply_markup: new InlineKeyboard()
+              .text("🖥 К серверам", "sv")
+              .row()
+              .text("🛠 Админ-панель", "a"),
+          }
+        );
+      } catch (error) {
+        pendingInputs.set(telegramId, pending);
+        const message = error instanceof Error ? error.message : String(error);
+        await ctx.reply(
+          `Не удалось запустить настройку: ${message}\n\nПопробуйте ещё раз. Формат:\nIP\nSSH-порт (по умолчанию 22)\nпароль root\nназвание сервера`,
+          {
+            reply_markup: new InlineKeyboard().text("❌ Отмена", "sv"),
+          }
+        );
+      }
+      return;
+    }
+
+    if (pending.kind === "server-rename") {
+      if (!isAdmin(ctx, appConfig)) return;
+      const server = await serverManager.getServer(pending.serverKey);
+      const name = normalizeDisplayName(ctx.message.text);
+      if (!server) {
+        await ctx.reply("Сервер не найден.", {
+          reply_markup: new InlineKeyboard().text("🖥 К серверам", "sv"),
+        });
+        return;
+      }
+      if (!name) {
+        await ctx.reply("Название должно содержать от 1 до 40 символов.", {
+          reply_markup: new InlineKeyboard()
+            .text("Попробовать снова", `svrn|${server.record.key}`)
+            .row()
+            .text("Назад", `svo|${server.record.key}`),
+        });
+        return;
+      }
+      if (server.record.isBuiltin) {
+        await db.updateServer(server.record.key, { name });
+      } else {
+        await db.updateServer(server.record.key, { name });
+      }
+      serverManager.invalidateCache();
+      await ctx.reply(`✅ Сервер переименован в «${name}».`, {
+        reply_markup: new InlineKeyboard()
+          .text("🖥 К серверу", `svo|${server.record.key}`)
+          .row()
+          .text("🛠 Админ-панель", "a"),
+      });
+      return;
+    }
+
     if (!isAdmin(ctx, appConfig)) return;
+    if (pending.kind !== "date") return;
     const expiresAt = parseFutureDate(ctx.message.text, appConfig.timezone);
     if (!expiresAt) {
       pendingInputs.set(telegramId, pending);
@@ -206,7 +284,8 @@ export function createBot(
       expiresAt,
       appConfig,
       db,
-      configService
+      configService,
+      serverManager
     );
   });
 
@@ -298,21 +377,21 @@ export function createBot(
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
     const configs = await db.listVisibleConfigs(user.id);
-    await showUserConfigs(ctx, configs, 0, trafficService);
+    await showUserConfigs(ctx, configs, 0, trafficService, serverManager);
   });
 
   bot.callbackQuery(/^ulp\|(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
     const configs = await db.listVisibleConfigs(user.id);
-    await showUserConfigs(ctx, configs, Number(ctx.match[1]), trafficService);
+    await showUserConfigs(ctx, configs, Number(ctx.match[1]), trafficService, serverManager);
   });
 
   bot.callbackQuery(/^uc\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     await ctx.answerCallbackQuery();
-    await showUserConfig(ctx, config, appConfig, trafficService);
+    await showUserConfig(ctx, config, appConfig, trafficService, serverManager);
   });
 
   bot.callbackQuery(/^rn\|(.+)$/, async (ctx) => {
@@ -364,33 +443,71 @@ export function createBot(
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
+    const servers = (await serverManager.listServers()).filter(
+      (server) => server.record.status === "ready"
+    );
+    if (servers.filter((server) => server.record.key !== config.serverKey).length === 0)
+      return showAlert(ctx, "Нет других серверов для перевыпуска.");
     await ctx.answerCallbackQuery();
+    const currentName = await serverManager.serverName(config.serverKey);
+    const keyboard = new InlineKeyboard();
+    for (const server of servers) {
+      const here = server.record.key === config.serverKey;
+      keyboard
+        .text(
+          `${here ? "· " : ""}${server.record.name}${here ? " (сейчас)" : ""}`,
+          `rrs|${config.id}|${server.record.key}`
+        )
+        .row();
+    }
+    keyboard.text("❌ Отмена", `uc|${config.id}`);
     await edit(
       ctx,
-      `🔄 Перевыпустить файл «${config.displayName}»?\n\nНовый файл будет создан на другом сервере. Старый файл останется доступен ещё примерно 5 минут, чтобы Вы успели переключиться, а затем перестанет подключаться. Название и срок действия сохранятся.`,
-      new InlineKeyboard()
-        .text("✅ Перевыпустить", `rrc|${config.id}`)
-        .row()
-        .text("❌ Отмена", `uc|${config.id}`)
+      `🔄 Перевыпуск «${config.displayName}»\n\nСейчас конфиг на сервере «${currentName}». Выберите сервер для нового файла — старый файл останется доступен ещё примерно 5 минут, чтобы Вы успели переключиться. Название и срок действия сохранятся.`,
+      keyboard
     );
   });
 
-  bot.callbackQuery(/^rrc\|(.+)$/, async (ctx) => {
+  bot.callbackQuery(/^rrs\|([^|]+)\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
+    const server = await serverManager.getServer(ctx.match[2]!);
+    if (!server || server.record.status !== "ready")
+      return showAlert(ctx, "Сервер недоступен.");
+    if (server.record.key === config.serverKey)
+      return showAlert(ctx, "Конфиг уже находится на этом сервере.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `🔄 Перевыпустить файл «${config.displayName}» на сервере «${server.record.name}»?\n\nСтарый файл останется доступен ещё примерно 5 минут, чтобы Вы успели переключиться, а затем перестанет подключаться. Название и срок действия сохранятся.`,
+      new InlineKeyboard()
+        .text("✅ Перевыпустить", `rrc|${config.id}|${server.record.key}`)
+        .row()
+        .text("❌ Отмена", `rr|${config.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^rrc\|([^|]+)\|(.+)$/, async (ctx) => {
+    const config = await ownedConfig(ctx, db, ctx.match[1]!);
+    if (!config) return showAlert(ctx, "Конфиг не найден.");
+    if (isExpired(config.expiresAt) || config.status !== "active")
+      return showAlert(ctx, "Просроченный конфиг нельзя перевыпустить.");
+    const server = await serverManager.getServer(ctx.match[2]!);
+    if (!server || server.record.status !== "ready")
+      return showAlert(ctx, "Сервер недоступен.");
     if (operationLocks.has(config.id))
       return showAlert(ctx, "Перевыпуск уже выполняется.");
 
     operationLocks.add(config.id);
     await ctx.answerCallbackQuery({ text: "Перевыпускаю файл…" });
     try {
-      const recreated = await configService.recreate(config);
+      const recreated = await configService.recreate(config, server.record.key);
       try {
         await edit(
           ctx,
-          `✅ Файл «${recreated.config.displayName}» перевыпущен на другом сервере. Старый конфиг отключится примерно через 5 минут.`,
+          `✅ Файл «${recreated.config.displayName}» перевыпущен на сервере «${server.record.name}». Старый конфиг отключится примерно через 5 минут.`,
           new InlineKeyboard()
             .text("🔎 Открыть конфиг", `uc|${recreated.config.id}`)
             .row()
@@ -402,7 +519,7 @@ export function createBot(
             vpnFileName(recreated.config.clientName)
           ),
           {
-            caption: `🔐 Новый файл для «${recreated.config.displayName}». Действует до ${formatDate(recreated.config.expiresAt, appConfig.timezone)}. Переключитесь на него: старый конфиг отключится примерно через 5 минут.`,
+            caption: `🔐 Новый файл для «${recreated.config.displayName}» (сервер «${server.record.name}»). Действует до ${formatDate(recreated.config.expiresAt, appConfig.timezone)}. Переключитесь на него: старый конфиг отключится примерно через 5 минут.`,
           }
         );
       } catch (deliveryError) {
@@ -435,20 +552,6 @@ export function createBot(
     }
   });
 
-  bot.callbackQuery(/^lm\|(.+)$/, async (ctx) => {
-    const config = await ownedConfig(ctx, db, ctx.match[1]!);
-    if (!config) return showAlert(ctx, "Конфиг не найден.");
-    await ctx.answerCallbackQuery({ text: "Перенос больше не требуется." });
-    await showUserConfig(ctx, config, appConfig, trafficService);
-  });
-
-  bot.callbackQuery(/^lmc\|(.+)$/, async (ctx) => {
-    const config = await ownedConfig(ctx, db, ctx.match[1]!);
-    if (!config) return showAlert(ctx, "Конфиг не найден.");
-    await ctx.answerCallbackQuery({ text: "Конфиг остаётся на текущем сервере." });
-    await showUserConfig(ctx, config, appConfig, trafficService);
-  });
-
   bot.callbackQuery("a", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
@@ -459,7 +562,61 @@ export function createBot(
   bot.callbackQuery("at", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     await ctx.answerCallbackQuery({ text: "Обновляю статистику…" });
-    await showTrafficStats(ctx, trafficService, vpn);
+    await showTrafficStats(ctx, trafficService, serverManager);
+  });
+
+  bot.callbackQuery("sv", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    pendingInputs.delete(String(ctx.from.id));
+    await ctx.answerCallbackQuery();
+    await showServersList(ctx, serverManager);
+  });
+
+  bot.callbackQuery(/^svo\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    await ctx.answerCallbackQuery();
+    await showServerCard(ctx, serverManager, db, trafficService, ctx.match[1]!);
+  });
+
+  bot.callbackQuery(/^svt\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const server = await serverManager.getServer(ctx.match[1]!);
+    if (!server) return showAlert(ctx, "Сервер не найден.");
+    const enabled = !server.record.enabled;
+    await db.updateServer(server.record.key, { enabled });
+    await ctx.answerCallbackQuery({
+      text: enabled
+        ? "Сервер снова доступен для новых конфигов."
+        : "Новые конфиги на этом сервере создаваться не будут.",
+    });
+    await showServerCard(ctx, serverManager, db, trafficService, server.record.key);
+  });
+
+  bot.callbackQuery(/^svrn\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const server = await serverManager.getServer(ctx.match[1]!);
+    if (!server) return showAlert(ctx, "Сервер не найден.");
+    pendingInputs.set(String(ctx.from.id), {
+      kind: "server-rename",
+      serverKey: server.record.key,
+    });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `✏️ Отправьте новое название для сервера «${server.record.name}». Не более 40 символов. Его увидят пользователи в своих конфигах.`,
+      new InlineKeyboard().text("❌ Отмена", `svo|${server.record.key}`)
+    );
+  });
+
+  bot.callbackQuery("svadd", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    pendingInputs.set(String(ctx.from.id), { kind: "server-add" });
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      "➕ Добавление сервера\n\nОтправьте одним сообщением четыре строки:\n1️⃣ IP или домен\n2️⃣ SSH-порт (обычно 22)\n3️⃣ Пароль root\n4️⃣ Название для пользователей\n\nБот подключится по SSH, установит OpenVPN и настроит сервер автоматически. Пароль используется один раз и нигде не сохраняется.",
+      new InlineKeyboard().text("❌ Отмена", "sv")
+    );
   });
 
   bot.callbackQuery("as", async (ctx) => {
@@ -582,7 +739,7 @@ export function createBot(
     if (!config || config.status === "revoked")
       return showAlert(ctx, "Конфиг не найден.");
     await ctx.answerCallbackQuery();
-    await showAdminConfig(ctx, config, db, appConfig, trafficService);
+    await showAdminConfig(ctx, config, db, appConfig, trafficService, serverManager);
   });
 
   bot.callbackQuery(/^adl\|(.+)$/, async (ctx) => {
@@ -621,28 +778,39 @@ export function createBot(
       return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Сначала продлите срок действия конфига.");
-    const targetServer = config.serverKey === "new" ? "old" : "new";
-    const targetName = targetServer === "old" ? "старый" : "новый";
+    const targets = (await serverManager.listServers()).filter(
+      (server) =>
+        server.record.status === "ready" &&
+        server.record.key !== config.serverKey
+    );
+    if (targets.length === 0)
+      return showAlert(ctx, "Нет других готовых серверов для переноса.");
     await ctx.answerCallbackQuery();
+    const keyboard = new InlineKeyboard();
+    for (const server of targets) {
+      keyboard
+        .text(server.record.name, `amc|${config.id}|${server.record.key}`)
+        .row();
+    }
+    keyboard.text("❌ Отмена", `ac|${config.id}`);
     await edit(
       ctx,
-      `🔄 Перенести «${config.displayName}» на ${targetName} сервер?\n\nБудет создан новый OpenVPN-клиент. Текущий файл сразу перестанет подключаться, а пользователю будет отправлен новый файл. Название и срок действия сохранятся.`,
-      new InlineKeyboard()
-        .text("✅ Подтвердить перенос", `amc|${config.id}|${targetServer}`)
-        .row()
-        .text("❌ Отмена", `ac|${config.id}`)
+      `🔄 Перенести «${config.displayName}» на другой сервер?\n\nБудет создан новый OpenVPN-клиент. Текущий файл сразу перестанет подключаться, а пользователю будет отправлен новый файл. Название и срок действия сохранятся.\n\nВыберите сервер:`,
+      keyboard
     );
   });
 
-  bot.callbackQuery(/^amc\|([^|]+)\|(new|old)$/, async (ctx) => {
+  bot.callbackQuery(/^amc\|([^|]+)\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const config = await db.getConfig(ctx.match[1]!);
-    const targetServer = ctx.match[2] as "new" | "old";
+    const targetServer = await serverManager.getServer(ctx.match[2]!);
     if (!config || config.status === "revoked")
       return showAlert(ctx, "Конфиг не найден.");
     if (isExpired(config.expiresAt) || config.status !== "active")
       return showAlert(ctx, "Сначала продлите срок действия конфига.");
-    if (config.serverKey === targetServer)
+    if (!targetServer || targetServer.record.status !== "ready")
+      return showAlert(ctx, "Сервер недоступен.");
+    if (config.serverKey === targetServer.record.key)
       return showAlert(ctx, "Конфиг уже находится на выбранном сервере.");
     if (operationLocks.has(config.id))
       return showAlert(ctx, "Операция уже выполняется.");
@@ -650,8 +818,8 @@ export function createBot(
     operationLocks.add(config.id);
     await ctx.answerCallbackQuery({ text: "Переношу конфиг…" });
     try {
-      const moved = await configService.moveToServer(config, targetServer);
-      const targetName = targetServer === "old" ? "старый" : "новый";
+      const moved = await configService.moveToServer(config, targetServer.record.key);
+      const targetName = targetServer.record.name;
       const user = await db.getUserById(config.userId);
 
       if (user) {
@@ -660,7 +828,7 @@ export function createBot(
             user.telegramId,
             new InputFile(moved.file, vpnFileName(moved.config.clientName)),
             {
-              caption: `🔄 Конфиг «${moved.config.displayName}» перенесён администратором на другой сервер. Старый файл больше не подключится. Используйте этот новый файл. Срок действия: до ${formatDate(moved.config.expiresAt, appConfig.timezone)}.`,
+              caption: `🔄 Конфиг «${moved.config.displayName}» перенесён администратором на сервер «${targetName}». Старый файл больше не подключится. Используйте этот новый файл. Срок действия: до ${formatDate(moved.config.expiresAt, appConfig.timezone)}.`,
               reply_markup: new InlineKeyboard().text(
                 "🔎 Открыть конфиг",
                 `uc|${moved.config.id}`
@@ -672,7 +840,7 @@ export function createBot(
 
       await edit(
         ctx,
-        `✅ Конфиг «${moved.config.displayName}» перенесён на ${targetName} сервер. Старый файл отозван.`,
+        `✅ Конфиг «${moved.config.displayName}» перенесён на сервер «${targetName}». Старый файл отозван.`,
         new InlineKeyboard()
           .text("📥 Получить новый файл", `adl|${moved.config.id}`)
           .row()
@@ -730,7 +898,7 @@ export function createBot(
         : dateAfterDays(Number(period), appConfig.timezone);
     const expiresAt = expiryFromDate(date, appConfig.timezone)!;
     await ctx.answerCallbackQuery({ text: "Выполняю…" });
-    await applyDateTarget(ctx, target, expiresAt, appConfig, db, configService);
+    await applyDateTarget(ctx, target, expiresAt, appConfig, db, configService, serverManager);
   });
 
   bot.callbackQuery(/^dc\|([ibe])\|(.+)$/, async (ctx) => {
@@ -750,31 +918,60 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const user = await db.getUserById(Number(ctx.match[1]));
     if (!user) return showAlert(ctx, "Пользователь не найден.");
-    if (!vpn.isConfigured("old"))
-      return showAlert(ctx, "Старый сервер пока не подключён.");
+    const servers = (await serverManager.listServers()).filter(
+      (server) => server.record.status === "ready"
+    );
+    if (servers.length === 0)
+      return showAlert(ctx, "Нет подключённых серверов.");
+    await ctx.answerCallbackQuery();
+    const keyboard = new InlineKeyboard();
+    for (const server of servers) {
+      keyboard
+        .text(server.record.name, `abs|${user.id}|${server.record.key}`)
+        .row();
+    }
+    keyboard.text("⬅️ Назад", `au|${user.id}`);
+    await edit(
+      ctx,
+      "🔗 Привязка существующего OpenVPN-клиента. Выберите сервер:",
+      keyboard
+    );
+  });
+
+  bot.callbackQuery(/^abs\|(\d+)\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const user = await db.getUserById(Number(ctx.match[1]));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    const server = await serverManager.getServer(ctx.match[2]!);
+    if (!server || server.record.status !== "ready")
+      return showAlert(ctx, "Сервер недоступен.");
     await ctx.answerCallbackQuery({ text: "Обновляю список…" });
     try {
-      const names = await vpn.listClients("old");
-      await db.syncLegacyClients("old", names);
-      const clients = await db.listUnassignedLegacyClients("old");
-      await showLegacyClients(ctx, user.id, clients, 0);
+      const names = await serverListClients(serverManager, server.target);
+      await db.syncLegacyClients(server.record.key, names);
+      const clients = await db.listUnassignedLegacyClients(server.record.key);
+      await showLegacyClients(ctx, user.id, clients, 0, server.record.key);
     } catch (error) {
       logError(error);
-      await ctx.reply("Не удалось прочитать список клиентов старого сервера.", {
-        reply_markup: new InlineKeyboard().text("Назад", `au|${user.id}`),
-      });
+      await ctx.reply(
+        `Не удалось прочитать список клиентов сервера «${server.record.name}».`,
+        {
+          reply_markup: new InlineKeyboard().text("Назад", `au|${user.id}`),
+        }
+      );
     }
   });
 
-  bot.callbackQuery(/^abp\|(\d+)\|(\d+)$/, async (ctx) => {
+  bot.callbackQuery(/^abp\|(\d+)\|(\d+)\|(.+)$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     const userId = Number(ctx.match[1]);
     const page = Number(ctx.match[2]);
+    const serverKey = ctx.match[3]!;
     const user = await db.getUserById(userId);
     if (!user) return showAlert(ctx, "Пользователь не найден.");
     await ctx.answerCallbackQuery();
-    const clients = await db.listUnassignedLegacyClients("old");
-    await showLegacyClients(ctx, userId, clients, page);
+    const clients = await db.listUnassignedLegacyClients(serverKey);
+    await showLegacyClients(ctx, userId, clients, page, serverKey);
   });
 
   bot.callbackQuery(/^abl\|(\d+)\|(\d+)$/, async (ctx) => {
@@ -879,7 +1076,8 @@ async function showUserConfigs(
   ctx: Context,
   configs: VpnConfigRecord[],
   requestedPage: number,
-  trafficService: TrafficService
+  trafficService: TrafficService,
+  serverManager: ServerManager
 ): Promise<void> {
   const { page, totalPages, items } = paginateConfigs(configs, requestedPage);
   const connectionStates = await trafficService.connectionStates(items);
@@ -909,11 +1107,13 @@ async function showUserConfig(
   ctx: Context,
   config: VpnConfigRecord,
   appConfig: AppConfig,
-  trafficService: TrafficService
+  trafficService: TrafficService,
+  serverManager: ServerManager
 ): Promise<void> {
   const expired = isExpired(config.expiresAt) || config.status === "expired";
   const status = expired ? "Просрочен" : "Активен";
   const traffic = await trafficService.forConfig(config);
+  const serverName = await serverManager.serverName(config.serverKey);
   const keyboard = new InlineKeyboard()
     .text("✏️ Переименовать", `rn|${config.id}`)
     .row();
@@ -929,7 +1129,7 @@ async function showUserConfig(
   keyboard.text("⬅️ Назад", "ul").text("🏠 Главное меню", "m");
   await edit(
     ctx,
-    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n${connectionStatusLine(traffic)}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}\n📊 Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
+    `🔐 Конфиг: ${config.displayName}\n${expired ? "🔴" : "🟢"} Статус: ${status}\n${connectionStatusLine(traffic)}\n🖥 Сервер: ${serverName}\n📅 Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}\n📊 Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
     keyboard
   );
 }
@@ -946,14 +1146,14 @@ async function showAdminMain(
     `👥 Пользователей: ${stats.users}`,
     `🟢 Активных конфигов: ${stats.active}`,
     `🔴 Просроченных в меню: ${stats.expired}`,
-    `На новом сервере: ${stats.new}`,
-    `На старом сервере: ${stats.old}`,
   ].join("\n");
   await edit(
     ctx,
     text,
     new InlineKeyboard()
       .text("🔎 Найти пользователя", "as")
+      .row()
+      .text("🖥 Серверы", "sv")
       .row()
       .text("📣 Рассылка", "bc")
       .row()
@@ -966,29 +1166,143 @@ async function showAdminMain(
 async function showTrafficStats(
   ctx: Context,
   trafficService: TrafficService,
-  vpn: OpenVpnGateway
+  serverManager: ServerManager
 ): Promise<void> {
   const stats = await trafficService.all();
-  const text = [
+  const names = await serverManager.serverNames();
+  const lines: string[] = [
     "📊 Статистика трафика",
     "",
     "🌐 Всего за всё время",
     `Всего: ${formatBytes(stats.total.totalBytes)}`,
     `↑ От пользователей: ${formatBytes(stats.total.uploadBytes)}`,
     `↓ Пользователям: ${formatBytes(stats.total.downloadBytes)}`,
-    "",
-    ...trafficServerLines(vpn.serverName("new"), stats.servers.new),
-    "",
-    ...trafficServerLines(vpn.serverName("old"), stats.servers.old),
-  ].join("\n");
+  ];
+  for (const [serverKey, traffic] of Object.entries(stats.servers)) {
+    lines.push(
+      "",
+      ...trafficServerLines(names.get(serverKey) ?? serverKey, traffic)
+    );
+  }
   await edit(
     ctx,
-    text,
+    lines.join("\n"),
     new InlineKeyboard()
       .text("🔄 Обновить", "at")
       .row()
       .text("⬅️ Админ-панель", "a")
   );
+}
+
+async function showServersList(
+  ctx: Context,
+  serverManager: ServerManager
+): Promise<void> {
+  const servers = await serverManager.listServers();
+  const keyboard = new InlineKeyboard();
+  for (const server of servers) {
+    keyboard
+      .text(
+        `${serverStatusIcon(server)} ${server.record.name}`,
+        `svo|${server.record.key}`
+      )
+      .row();
+  }
+  keyboard.text("➕ Добавить сервер", "svadd").row();
+  keyboard.text("⬅️ Админ-панель", "a");
+  await edit(
+    ctx,
+    servers.length
+      ? `🖥 Серверы\n\n🟢 работает\n⏳ настраивается\n🔴 ошибка настройки\n⏸ не выдаёт конфиги\n\nВсего: ${servers.length}`
+      : "🖥 Серверы пока не подключены.",
+    keyboard
+  );
+}
+
+async function showServerCard(
+  ctx: Context,
+  serverManager: ServerManager,
+  db: AppDatabase,
+  trafficService: TrafficService,
+  serverKey: ServerKey
+): Promise<void> {
+  const server = await serverManager.getServer(serverKey);
+  if (!server) {
+    await edit(
+      ctx,
+      "Сервер не найден.",
+      new InlineKeyboard().text("🖥 К серверам", "sv")
+    );
+    return;
+  }
+  const { record } = server;
+  const lines: string[] = [
+    `🖥 Сервер: ${record.name}`,
+    `🌐 Адрес: ${record.host}:${record.port}`,
+    record.status === "ready"
+      ? "🟢 Статус: работает"
+      : record.status === "pending"
+        ? "⏳ Статус: настраивается"
+        : `🔴 Статус: ошибка настройки${record.lastError ? ` — ${record.lastError}` : ""}`,
+    record.enabled
+      ? "✅ Выдача новых конфигов: включена"
+      : "⏸ Выдача новых конфигов: выключена",
+  ];
+
+  if (record.status === "ready") {
+    const stats = await db.stats();
+    const configs = stats.perServer[record.key] ?? 0;
+    const { sessions, liveAvailable } =
+      await trafficService.activeSessionsForServer(record.key);
+    lines.push(`🔐 Конфигов на сервере: ${configs}`);
+    lines.push(
+      liveAvailable
+        ? `🔌 Подключений сейчас: ${sessions.length}`
+        : "❔ Сервер не отвечает по SSH"
+    );
+    const completed = (await db.completedTrafficByServer())[record.key] ?? {
+      uploadBytes: 0,
+      downloadBytes: 0,
+    };
+    const upload = completed.uploadBytes + sumActiveUpload(sessions);
+    const download = completed.downloadBytes + sumActiveDownload(sessions);
+    lines.push(
+      `📊 Трафик: ${formatBytes(upload + download)} (↑ ${formatBytes(upload)}, ↓ ${formatBytes(download)})`
+    );
+  }
+
+  const keyboard = new InlineKeyboard();
+  if (record.status === "ready") {
+    keyboard
+      .text(
+        record.enabled ? "⏸ Остановить выдачу" : "▶️ Возобновить выдачу",
+        `svt|${record.key}`
+      )
+      .row()
+      .text("✏️ Переименовать", `svrn|${record.key}`)
+      .row();
+  }
+  keyboard
+    .text("🔄 Обновить", `svo|${record.key}`)
+    .row()
+    .text("⬅️ К серверам", "sv")
+    .row()
+    .text("🛠 Админ-панель", "a");
+  await edit(ctx, lines.join("\n"), keyboard);
+}
+
+function sumActiveUpload(sessions: { uploadBytes: number }[]): number {
+  return sessions.reduce((total, session) => total + session.uploadBytes, 0);
+}
+
+function sumActiveDownload(sessions: { downloadBytes: number }[]): number {
+  return sessions.reduce((total, session) => total + session.downloadBytes, 0);
+}
+
+function serverStatusIcon(server: ServerWithTarget): string {
+  if (server.record.status === "pending") return "⏳";
+  if (server.record.status === "error") return "🔴";
+  return server.record.enabled ? "🟢" : "⏸";
 }
 
 async function showAdminUser(
@@ -1027,18 +1341,20 @@ async function showAdminConfig(
   config: VpnConfigRecord,
   db: AppDatabase,
   appConfig: AppConfig,
-  trafficService: TrafficService
+  trafficService: TrafficService,
+  serverManager: ServerManager
 ): Promise<void> {
   const user = (await db.getUserById(config.userId))!;
   const expired = isExpired(config.expiresAt) || config.status === "expired";
   const traffic = await trafficService.forConfig(config);
+  const serverName = await serverManager.serverName(config.serverKey);
   const text = [
     `Конфиг: ${config.displayName}`,
     `Пользователь: ${userLabel(user)}`,
     `Статус: ${expired ? "Просрочен" : "Активен"}`,
     connectionStatusLine(traffic),
     `Действует до: ${formatDate(config.expiresAt, appConfig.timezone)}`,
-    `Сервер: ${config.serverKey === "old" ? "старый" : "новый"}`,
+    `Сервер: ${serverName}`,
     `OpenVPN-клиент: ${config.clientName}`,
     `Трафик: ${formatBytes(traffic.totalBytes)} (↑ ${formatBytes(traffic.uploadBytes)}, ↓ ${formatBytes(traffic.downloadBytes)})`,
   ].join("\n");
@@ -1086,7 +1402,8 @@ async function showLegacyClients(
   ctx: Context,
   userId: number,
   clients: LegacyClientRecord[],
-  requestedPage: number
+  requestedPage: number,
+  serverKey: ServerKey
 ): Promise<void> {
   const pageSize = 10;
   const totalPages = Math.max(1, Math.ceil(clients.length / pageSize));
@@ -1096,10 +1413,10 @@ async function showLegacyClients(
   for (const client of pageClients)
     keyboard.text(client.clientName, `abl|${userId}|${client.id}`).row();
   if (totalPages > 1) {
-    if (page > 0) keyboard.text("⬅️", `abp|${userId}|${page - 1}`);
-    keyboard.text(`${page + 1}/${totalPages}`, `abp|${userId}|${page}`);
+    if (page > 0) keyboard.text("⬅️", `abp|${userId}|${page - 1}|${serverKey}`);
+    keyboard.text(`${page + 1}/${totalPages}`, `abp|${userId}|${page}|${serverKey}`);
     if (page < totalPages - 1)
-      keyboard.text("➡️", `abp|${userId}|${page + 1}`);
+      keyboard.text("➡️", `abp|${userId}|${page + 1}|${serverKey}`);
     keyboard.row();
   }
   keyboard.text("Назад", `au|${userId}`);
@@ -1107,7 +1424,7 @@ async function showLegacyClients(
     ctx,
     clients.length
       ? `Выберите существующий OpenVPN-клиент:\n\nСтраница ${page + 1} из ${totalPages} · доступно: ${clients.length}`
-      : "Непривязанных клиентов на старом сервере нет.",
+      : "Непривязанных клиентов на этом сервере нет.",
     keyboard
   );
 }
@@ -1118,7 +1435,8 @@ async function applyDateTarget(
   expiresAt: string,
   appConfig: AppConfig,
   db: AppDatabase,
-  service: ConfigService
+  service: ConfigService,
+  serverManager: ServerManager
 ): Promise<void> {
   const lockKey =
     target.kind === "issue"
@@ -1143,9 +1461,10 @@ async function applyDateTarget(
         appConfig,
         "✅ Новый конфиг готов."
       );
+      const serverName = await serverManager.serverName(config.serverKey);
       await respond(
         ctx,
-        `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}. Сервер: ${config.serverKey === "old" ? "старый" : "новый"}.`,
+        `Конфиг «${config.displayName}» выдан пользователю ${userLabel(user)}. Сервер: ${serverName}.`,
         new InlineKeyboard()
           .text("🔎 Открыть конфиг", `ac|${config.id}`)
           .row()
@@ -1213,6 +1532,13 @@ async function applyDateTarget(
   }
 }
 
+async function serverListClients(
+  serverManager: ServerManager,
+  target: VpnServerTarget
+): Promise<string[]> {
+  return serverManager.listClients(target);
+}
+
 async function notifyConfigReady(
   ctx: Context,
   user: UserRecord,
@@ -1250,6 +1576,14 @@ async function ownedConfig(
     config.status !== "revoked"
     ? config
     : null;
+}
+
+function notifyAdmin(bot: Bot, appConfig: AppConfig, text: string): void {
+  bot.api
+    .sendMessage(appConfig.adminTelegramId, text, {
+      reply_markup: new InlineKeyboard().text("🖥 К серверам", "sv"),
+    })
+    .catch(logError);
 }
 
 function statusIcon(config: VpnConfigRecord): string {
