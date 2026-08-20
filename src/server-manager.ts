@@ -272,6 +272,9 @@ if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
     curl -fsSL https://git.io/vpn -o openvpn-install.sh
     chmod +x openvpn-install.sh
     AUTO_INSTALL=y bash openvpn-install.sh
+    # NAT64-костыль хостеров на /64 ломает клиентов без v6-роутов — выключаем v6-туннель.
+    sed -i '/^server-ipv6/d' /etc/openvpn/server/server.conf
+    sed -i 's/^push "redirect-gateway def1 ipv6 /push "redirect-gateway def1 /' /etc/openvpn/server/server.conf
   fi
   curl -fsSL https://raw.githubusercontent.com/Ralf303/vpnbot/main/deploy/openvpn-bot-helper -o /usr/local/sbin/openvpn-bot-helper
   chmod 0755 /usr/local/sbin/openvpn-bot-helper
