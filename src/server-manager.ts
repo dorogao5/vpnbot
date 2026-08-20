@@ -275,6 +275,24 @@ if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
     # NAT64-костыль хостеров на /64 ломает клиентов без v6-роутов — выключаем v6-туннель.
     sed -i '/^server-ipv6/d' /etc/openvpn/server/server.conf
     sed -i 's/^push "redirect-gateway def1 ipv6 /push "redirect-gateway def1 /' /etc/openvpn/server/server.conf
+    # DPI в РФ режет OpenVPN UDP — добавляем TCP-инстанс на 443
+    cd /etc/openvpn/server
+    cp server.conf server-tcp.conf
+    sed -i \
+      -e 's|^port .*|port 443|' \
+      -e 's|^proto .*|proto tcp-server|' \
+      -e 's|^dev tun$|dev tun1|' \
+      -e 's|^server 10.8.0.0 255.255.255.0|server 10.9.0.0 255.255.255.0|' \
+      -e 's|^ifconfig-pool-persist ipp.txt|ifconfig-pool-persist ipp-tcp.txt|' \
+      -e 's|^status /run/openvpn-server/server-status.tsv|status /run/openvpn-server/server-status-tcp.tsv|' \
+      -e 's|^client-disconnect .*||' \
+      server-tcp.conf
+    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+    iptables -t nat -C POSTROUTING -s 10.9.0.0/24 ! -d 10.9.0.0/24 -j SNAT --to-source $(curl -fsSL ifconfig.me) 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s 10.9.0.0/24 ! -d 10.9.0.0/24 -j MASQUERADE
+    iptables -C FORWARD -s 10.9.0.0/24 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.9.0.0/24 -j ACCEPT
+    systemctl enable openvpn-server@server-tcp.service >/dev/null 2>&1
+    systemctl start openvpn-server@server-tcp.service
   fi
   curl -fsSL https://raw.githubusercontent.com/Ralf303/vpnbot/main/deploy/openvpn-bot-helper -o /usr/local/sbin/openvpn-bot-helper
   chmod 0755 /usr/local/sbin/openvpn-bot-helper
