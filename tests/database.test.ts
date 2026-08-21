@@ -15,6 +15,19 @@ afterEach(async () => {
 });
 
 describe("AppDatabase с Prisma", () => {
+  it("нормализует, хранит и удаляет белые домены", async () => {
+    expect(await db.addBypassDomains(["Example.COM", "пример.рф", "example.com"])).toBe(2);
+    const domains = await db.listBypassDomains();
+    expect(domains.map((entry) => entry.domain)).toEqual([
+      "example.com",
+      "xn--e1afmkfd.xn--p1ai",
+    ]);
+    expect(await db.deleteBypassDomain(domains[0]!.id)).toBe(true);
+    expect((await db.listBypassDomains()).map((entry) => entry.domain)).toEqual([
+      "xn--e1afmkfd.xn--p1ai",
+    ]);
+  });
+
   it("обновляет username зарегистрированного пользователя", async () => {
     const first = await db.upsertUser({ telegramId: "100", username: "old", firstName: "Иван" });
     const updated = await db.upsertUser({ telegramId: "100", username: "new", firstName: "Иван" });
@@ -51,4 +64,72 @@ describe("AppDatabase с Prisma", () => {
     await db.syncLegacyClients("old", ["second", "third"]);
     expect((await db.listUnassignedLegacyClients("old")).map((item) => item.clientName)).toEqual(["second", "third"]);
   });
+
+  it("массово прибавляет срок только действующим конфигам", async () => {
+    const user = await db.upsertUser({ telegramId: "400", firstName: "Иван" });
+    const active = testConfig(user.id, "active-client", "2026-01-31T20:59:59.999Z");
+    const expired = {
+      ...testConfig(user.id, "expired-client", "2026-01-01T20:59:59.999Z"),
+      id: randomUUID(),
+      status: "expired" as const,
+      revokedAt: "2026-01-02T20:59:59.999Z",
+    };
+    await db.insertConfig(active);
+    await db.insertConfig(expired);
+
+    expect(await db.countExtendableConfigs()).toBe(1);
+    expect(await db.extendAllActiveConfigs({ months: 1 })).toBe(1);
+
+    const updated = await db.getConfig(active.id);
+    expect(updated?.expiresAt).toBe("2026-02-28T20:59:59.999Z");
+    expect(updated?.hiddenAt).toBe("2026-03-10T20:59:59.999Z");
+    expect((await db.getConfig(expired.id))?.expiresAt).toBe(expired.expiresAt);
+  });
+
+  it("удаляет сервер из пула, сохраняя конфиги и занятый srv_N", async () => {
+    const user = await db.upsertUser({ telegramId: "500", firstName: "Ольга" });
+    await db.createServerPlaceholder({
+      key: "srv_7",
+      name: "Удаляемый",
+      host: "192.0.2.7",
+      port: 22,
+      sshUser: "vpn-bot",
+      sshPrivateKey: "key",
+      hostFingerprint: "SHA256:test",
+    });
+    const config = testConfig(user.id, "kept-client", "2026-12-31T20:59:59.999Z");
+    config.serverKey = "srv_7";
+    await db.insertConfig(config);
+    await db.syncLegacyClients("srv_7", ["orphan-client"]);
+
+    const result = await db.deleteServer("srv_7");
+
+    expect(result).toMatchObject({ configs: 1, legacyClients: 1 });
+    expect(await db.getServerByKey("srv_7")).toBeNull();
+    expect(await db.getConfig(config.id)).not.toBeNull();
+    expect(await db.listUnassignedLegacyClients("srv_7")).toEqual([]);
+    expect(await db.maxDynamicServerId()).toBe(7);
+  });
 });
+
+function testConfig(
+  userId: number,
+  clientName: string,
+  expiresAt: string
+): VpnConfigRecord {
+  const now = "2026-01-01T00:00:00.000Z";
+  return {
+    id: randomUUID(),
+    userId,
+    displayName: clientName,
+    clientName,
+    serverKey: "new",
+    expiresAt,
+    status: "active",
+    isLegacy: false,
+    revokedAt: null,
+    hiddenAt: "2027-01-10T20:59:59.999Z",
+    createdAt: now,
+    updatedAt: now,
+  };
+}

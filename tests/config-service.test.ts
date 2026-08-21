@@ -8,7 +8,11 @@ import { AppDatabase } from "../src/database.js";
 import type { VpnServerTarget } from "../src/openvpn.js";
 import { createCleanDatabase } from "./database-fixture.js";
 
-function serverTarget(key: string, clients: string[]): VpnServerTarget {
+function serverTarget(
+  key: string,
+  clients: string[],
+  relay?: { host: string; port: number }
+): VpnServerTarget {
   return {
     key,
     name: key === "new" ? "Новый сервер" : key === "old" ? "Старый сервер" : key,
@@ -18,6 +22,7 @@ function serverTarget(key: string, clients: string[]): VpnServerTarget {
     privateKey: Buffer.from("key"),
     hostFingerprint: "SHA256:test",
     helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
+    ...(relay ? { relay } : {}),
   };
 }
 
@@ -44,12 +49,12 @@ class FakeVpn implements VpnOperations {
   async createClient(server: VpnServerTarget, client: string): Promise<Buffer> {
     this.calls.push(`create:${server.key}:${client}`);
     this.clients.get(server.key)!.push(client);
-    return Buffer.from("client\ndev tun\n");
+    return Buffer.from("client\ndev tun\nproto tcp-client\nremote vpn.test 1194\n");
   }
 
   async downloadClient(server: VpnServerTarget, client: string): Promise<Buffer> {
     this.calls.push(`download:${server.key}:${client}`);
-    return Buffer.from("client\ndev tun\n");
+    return Buffer.from("client\ndev tun\nproto tcp-client\nremote vpn.test 1194\n");
   }
 
   async revokeClient(server: VpnServerTarget, client: string): Promise<void> {
@@ -60,28 +65,32 @@ class FakeVpn implements VpnOperations {
 }
 
 class FakeResolver implements ServerResolver {
+  readonly relays = new Map<string, { host: string; port: number }>();
+
   constructor(private readonly vpn: FakeVpn) {}
 
   async resolveTarget(serverKey: string): Promise<VpnServerTarget | null> {
     if (!this.vpn.clients.has(serverKey)) return null;
-    return serverTarget(serverKey, []);
+    return serverTarget(serverKey, [], this.relays.get(serverKey));
   }
 
   async usableTargets(): Promise<VpnServerTarget[]> {
     return [...this.vpn.enabled.entries()]
       .filter(([, enabled]) => enabled)
-      .map(([key]) => serverTarget(key, []));
+      .map(([key]) => serverTarget(key, [], this.relays.get(key)));
   }
 }
 
 let db: AppDatabase;
 let vpn: FakeVpn;
+let resolver: FakeResolver;
 let service: ConfigService;
 
 beforeEach(async () => {
   db = await createCleanDatabase();
   vpn = new FakeVpn();
-  service = new ConfigService(db, vpn, new FakeResolver(vpn));
+  resolver = new FakeResolver(vpn);
+  service = new ConfigService(db, vpn, resolver);
 });
 
 afterEach(async () => {
@@ -89,6 +98,27 @@ afterEach(async () => {
 });
 
 describe("ConfigService", () => {
+  it("добавляет домены из БД в повторно скачанный профиль", async () => {
+    await db.addBypassDomains(["Direct.Example"]);
+    const user = await db.upsertUser({ telegramId: "domain", firstName: "Domain" });
+    const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
+
+    const file = await service.download(config);
+    expect(file.toString("utf8")).toContain(
+      "route direct.example 255.255.255.255 net_gateway"
+    );
+  });
+
+  it("подставляет relay-порт именно того сервера, где лежит конфиг", async () => {
+    resolver.relays.set("new", { host: "198.51.100.10", port: 4443 });
+    vpn.enabled.set("old", false);
+    const user = await db.upsertUser({ telegramId: "relay", firstName: "Relay" });
+    const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
+
+    const file = await service.download(config);
+    expect(file.toString("utf8")).toContain("remote 198.51.100.10 4443");
+  });
+
   it("при равной нагрузке создаёт новый клиент на сервере с лексикографически первым ключом", async () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
@@ -226,5 +256,23 @@ describe("ConfigService", () => {
     await expect(service.moveToServer(moved.config, targetKey)).rejects.toThrow(
       "уже находится"
     );
+  });
+
+  it("переносит конфиг с уже удалённого сервера без отката", async () => {
+    const user = await db.upsertUser({ telegramId: "orphan", firstName: "Олег" });
+    await db.syncLegacyClients("old", ["orphan_client"]);
+    const legacy = (await db.listUnassignedLegacyClients("old"))[0]!;
+    const config = await service.bindLegacy(
+      user,
+      legacy,
+      "2027-06-01T20:59:59.999Z"
+    );
+    vpn.clients.delete("old");
+
+    const moved = await service.moveToServer(config, "new");
+
+    expect(moved.config.serverKey).toBe("new");
+    expect(moved.config.clientName).not.toBe("orphan_client");
+    expect(vpn.calls).not.toContain("revoke:old:orphan_client");
   });
 });

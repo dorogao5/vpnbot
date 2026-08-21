@@ -14,7 +14,7 @@ const vpn = new OpenVpnGateway(config.envServers, (key) =>
   key === "new" ? "Новый сервер" : key === "old" ? "Старый сервер" : key
 );
 const serverManager = new ServerManager(db, vpn, config);
-const configService = new ConfigService(db, vpn, serverManager);
+const configService = new ConfigService(db, vpn, serverManager, config.vpnProfile);
 const trafficService = new TrafficService(db, vpn, serverManager);
 const { bot } = createBot(config, db, configService, trafficService, serverManager);
 const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService, serverManager);

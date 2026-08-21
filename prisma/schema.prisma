@@ -136,6 +136,8 @@ model VpnServer {
   sshUser         String       @default("vpn-bot") @map("ssh_user")
   sshPrivateKey   String       @map("ssh_private_key")
   hostFingerprint String       @map("host_fingerprint")
+  relayPort       Int?         @unique @map("relay_port")
+  relayManaged    Boolean      @default(false) @map("relay_managed")
   status          ServerStatus @default(ready)
   enabled         Boolean      @default(true)
   isBuiltin       Boolean      @default(false) @map("is_builtin")
@@ -144,4 +146,12 @@ model VpnServer {
   updatedAt       DateTime     @updatedAt @db.Timestamptz(3) @map("updated_at")
 
   @@map("vpn_servers")
+}
+
+model BypassDomain {
+  id        Int      @id @default(autoincrement())
+  domain    String   @unique @db.VarChar(253)
+  createdAt DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  @@map("bypass_domains")
 }

@@ -9,6 +9,8 @@ import type {
 import { vpnFileName } from "./file-name.js";
 import { hiddenAtFromExpiry, isExpired } from "./time.js";
 import type { VpnServerTarget } from "./openvpn.js";
+import type { VpnProfileOptions } from "./config.js";
+import { prepareVpnProfile } from "./vpn-profile.js";
 
 export interface VpnOperations {
   createClient(server: VpnServerTarget, clientName: string): Promise<Buffer>;
@@ -37,7 +39,13 @@ export class ConfigService {
   constructor(
     private readonly db: AppDatabase,
     private readonly vpn: VpnOperations,
-    private readonly servers: ServerResolver
+    private readonly servers: ServerResolver,
+    private readonly profileOptions: VpnProfileOptions = {
+      relay: undefined,
+      bypassRoutes: [],
+      bypassDomains: [],
+      blockIpv6: false,
+    }
   ) {}
 
   async issue(user: UserRecord, expiresAt: string): Promise<VpnConfigRecord> {
@@ -107,7 +115,10 @@ export class ConfigService {
       throw new Error("Срок действия конфига истёк");
     }
     const target = await this.requireTarget(config.serverKey);
-    return this.vpn.downloadClient(target, config.clientName);
+    return prepareVpnProfile(
+      await this.vpn.downloadClient(target, config.clientName),
+      await this.profileOptionsFor(target)
+    );
   }
 
   async downloadExisting(config: VpnConfigRecord): Promise<Buffer> {
@@ -115,7 +126,10 @@ export class ConfigService {
       throw new Error("Конфиг отозван");
     }
     const target = await this.requireTarget(config.serverKey);
-    return this.vpn.downloadClient(target, config.clientName);
+    return prepareVpnProfile(
+      await this.vpn.downloadClient(target, config.clientName),
+      await this.profileOptionsFor(target)
+    );
   }
 
   async changeExpiry(
@@ -194,6 +208,9 @@ export class ConfigService {
     config: VpnConfigRecord;
     file: Buffer;
   }> {
+    const previous = delayedRevocation
+      ? null
+      : await this.servers.resolveTarget(config.serverKey);
     const { clientName: newClientName, file } =
       await this.createUniqueClient(target);
     try {
@@ -236,9 +253,17 @@ export class ConfigService {
       };
     }
 
+    if (!previous) {
+      console.info(
+        `Конфиг ${config.id} перенесён без отзыва старого клиента: сервер ${config.serverKey} удалён или недоступен`
+      );
+      return {
+        config: (await this.db.getConfig(config.id))!,
+        file,
+      };
+    }
+
     try {
-      const previous = await this.servers.resolveTarget(config.serverKey);
-      if (!previous) throw new Error("Предыдущий сервер не настроен");
       await this.vpn.revokeClient(previous, config.clientName);
     } catch (error) {
       await this.db.restoreClient(config);
@@ -274,7 +299,10 @@ export class ConfigService {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const clientName = randomClientName();
       if (!(await this.db.reserveClientName(clientName))) continue;
-      const file = await this.vpn.createClient(target, clientName);
+      const file = prepareVpnProfile(
+        await this.vpn.createClient(target, clientName),
+        await this.profileOptionsFor(target)
+      );
       return { clientName, file };
     }
     throw new Error("Не удалось сгенерировать уникальное имя VPN-конфига");
@@ -284,6 +312,19 @@ export class ConfigService {
     const target = await this.servers.resolveTarget(serverKey);
     if (!target) throw new Error("VPN-сервер этого конфига не подключён к боту");
     return target;
+  }
+
+  private async profileOptionsFor(target: VpnServerTarget): Promise<VpnProfileOptions> {
+    const databaseDomains = (await this.db.listBypassDomains())
+      .map((entry) => entry.domain);
+    return {
+      ...this.profileOptions,
+      relay: target.relay ?? this.profileOptions.relay,
+      bypassDomains: [...new Set([
+        ...this.profileOptions.bypassDomains,
+        ...databaseDomains,
+      ])],
+    };
   }
 
   private async selectIssueTarget(): Promise<VpnServerTarget> {

@@ -25,9 +25,16 @@ services:
       - ./secrets/new_vpn_ssh_key:/run/secrets/new_vpn_ssh_key:ro
       - ./secrets/old_vpn_ssh_key:/run/secrets/old_vpn_ssh_key:ro
       - ./secrets/bootstrap_key.pub:/run/secrets/bootstrap_key.pub:ro
+      - ./secrets/relay_tunnel_key:/run/secrets/relay_tunnel_key:ro
+      - ./secrets/relay_host_key.pub:/run/secrets/relay_host_key.pub:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     init: true
 
 volumes:
   postgres_data:
+
+networks:
+  default:
+    name: vpnbot
+    external: true

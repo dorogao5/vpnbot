@@ -21,6 +21,10 @@ const appConfig: AppConfig = {
   reminderHour: 10,
   helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
   bootstrapPublicKey: undefined,
+  telegramProxyUrl: undefined,
+  sshProxyUrl: undefined,
+  vpnProfile: { relay: undefined, bypassRoutes: [], bypassDomains: [], blockIpv6: false },
+  relayProvisioning: undefined,
   envServers: {},
 };
 
@@ -33,6 +37,7 @@ const TEST_TARGET: VpnServerTarget = {
   privateKey: Buffer.from("key"),
   hostFingerprint: "SHA256:test",
   helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
+  proxyUrl: undefined,
 };
 
 const testResolver: ServerResolver = {
