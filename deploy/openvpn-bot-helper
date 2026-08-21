@@ -6,9 +6,11 @@ OPENVPN_DIR="/etc/openvpn/server"
 EASYRSA_DIR="$OPENVPN_DIR/easy-rsa"
 PKI_DIR="$EASYRSA_DIR/pki"
 CLIENT_COMMON="$OPENVPN_DIR/client-common.txt"
+TCP_SERVER_CONF="$OPENVPN_DIR/server-tcp.conf"
 LOCK_FILE="/run/lock/openvpn-bot-helper.lock"
 VPN_SUBNET="10.8.0.0/24"
 STATUS_FILE="/run/openvpn-server/server-status.tsv"
+STATUS_TCP_FILE="/run/openvpn-server/server-status-tcp.tsv"
 TRAFFIC_EVENTS_DIR="/var/lib/openvpn-bot/traffic-events"
 
 die() {
@@ -38,11 +40,29 @@ is_revoked_client() {
   awk -F= -v client="$client" '$1 ~ /^R/ && $NF == client { found=1 } END { exit !found }' "$PKI_DIR/index.txt"
 }
 
+build_client_common() {
+  local common="$CLIENT_COMMON"
+  local cfg
+  if [[ -f "$TCP_SERVER_CONF" ]]; then
+    local tcp_port
+    tcp_port="$(awk '/^port / { print $2; exit }' "$TCP_SERVER_CONF" 2>/dev/null || true)"
+    [[ -n "$tcp_port" ]] || tcp_port="54"
+    cfg="$(mktemp)"
+    cp "$CLIENT_COMMON" "$cfg"
+    sed -i 's|^proto udp$|proto tcp-client|' "$cfg"
+    sed -i "s|^remote \([^ ]\+\) 1194$|remote \1 $tcp_port|" "$cfg"
+    common="$cfg"
+  fi
+  printf '%s\n' "$common"
+}
+
 render_client() {
   local client="$1"
   local inline="$PKI_DIR/inline/private/$client.inline"
+  local common
   [[ -f "$inline" ]] || die "Данные клиента не найдены"
-  grep -vh '^#' "$CLIENT_COMMON" "$inline"
+  common="$(build_client_common)"
+  grep -vh '^#' "$common" "$inline"
 }
 
 refresh_crl() {
