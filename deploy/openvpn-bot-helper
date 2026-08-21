@@ -50,7 +50,7 @@ build_client_common() {
     cfg="$(mktemp)"
     cp "$CLIENT_COMMON" "$cfg"
     sed -i 's|^proto udp$|proto tcp-client|' "$cfg"
-    sed -i "s|^remote \([^ ]\+\) 1194$|remote \1 $tcp_port|" "$cfg"
+    sed -i -E "s|^remote ([^ ]+) [0-9]+$|remote \1 $tcp_port|" "$cfg"
     common="$cfg"
   fi
   printf '%s\n' "$common"
