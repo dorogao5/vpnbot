@@ -14,7 +14,7 @@ import type {
 } from "./domain.js";
 import type { VpnServerTarget } from "./openvpn.js";
 import { ServerManager, type ServerWithTarget } from "./server-manager.js";
-import { vpnFileName } from "./file-name.js";
+import { labeledVpnFileName, vpnFileName } from "./file-name.js";
 import {
   TrafficService,
   type ConfigConnectionState,
@@ -85,6 +85,7 @@ export function createBot(
     { text: string; entities?: MessageEntity[] }
   >();
   let broadcastRunning = false;
+  const allFilesLocks = new Set<string>();
 
   serverManager.onBootstrapFinished = (text) => notifyAdmin(bot, appConfig, text);
 
@@ -176,7 +177,9 @@ export function createBot(
       await ctx.reply(message, {
         ...(ctx.message.entities ? { entities: ctx.message.entities } : {}),
         reply_markup: new InlineKeyboard()
-          .text("✅ Подтвердить рассылку", "bcc")
+          .text("✅ Отправить сообщение", "bcc")
+          .row()
+          .text("📦 Отправить с кнопкой файлов", "bccf")
           .row()
           .text("❌ Отменить", "bca"),
       });
@@ -450,6 +453,62 @@ export function createBot(
       `✏️ Отправьте новое название для «${config.displayName}». Не более 40 символов.`,
       new InlineKeyboard().text("❌ Отмена", `uc|${config.id}`)
     );
+  });
+
+  bot.callbackQuery("dla", async (ctx) => {
+    const telegramId = String(ctx.from.id);
+    if (allFilesLocks.has(telegramId)) {
+      return showAlert(ctx, "Файлы уже подготавливаются.");
+    }
+    const user = await db.getUserByTelegramId(telegramId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    const configs = (await db.listVisibleConfigs(user.id)).filter(
+      (config) => config.status === "active" && !isExpired(config.expiresAt)
+    );
+    if (configs.length === 0) {
+      return showAlert(ctx, "У Вас нет действующих конфигов.");
+    }
+
+    allFilesLocks.add(telegramId);
+    await ctx.answerCallbackQuery({ text: "Подготавливаю файлы…" });
+    await ctx.reply(
+      `⏳ Подготавливаю Ваши действующие конфиги: ${configs.length}. Файлы придут отдельными сообщениями.`
+    );
+    let delivered = 0;
+    let failed = 0;
+    try {
+      for (const config of configs) {
+        try {
+          const file = await configService.download(config);
+          await ctx.replyWithDocument(
+            new InputFile(
+              file,
+              labeledVpnFileName(config.displayName, config.clientName)
+            ),
+            {
+              caption: `🔐 ${config.displayName}\n📅 Действует до ${formatDate(config.expiresAt, appConfig.timezone)}`,
+            }
+          );
+          delivered += 1;
+        } catch (error) {
+          failed += 1;
+          logError(error);
+        }
+      }
+      await ctx.reply(
+        failed === 0
+          ? `✅ Все файлы отправлены: ${delivered}. Удалите старые профили из OpenVPN Connect и импортируйте полученные заново.`
+          : `⚠️ Отправлено файлов: ${delivered}. Не удалось подготовить: ${failed}. Если нужного файла нет, обратитесь к администратору.`,
+        {
+          reply_markup: mainKeyboard(
+            isAdmin(ctx, appConfig),
+            appConfig.contactUrl
+          ),
+        }
+      );
+    } finally {
+      allFilesLocks.delete(telegramId);
+    }
   });
 
   bot.callbackQuery(/^dl\|(.+)$/, async (ctx) => {
@@ -868,13 +927,14 @@ export function createBot(
     await showAdminMain(ctx, db);
   });
 
-  bot.callbackQuery("bcc", async (ctx) => {
+  bot.callbackQuery(/^bcc(f)?$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     if (broadcastRunning)
       return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
     const telegramId = String(ctx.from.id);
     const draft = broadcastDrafts.get(telegramId);
     if (!draft) return showAlert(ctx, "Черновик рассылки не найден.");
+    const includeFilesButton = ctx.match[1] === "f";
 
     broadcastRunning = true;
     broadcastDrafts.delete(telegramId);
@@ -895,6 +955,14 @@ export function createBot(
           async (recipientId, text) => {
             await bot.api.sendMessage(recipientId, text, {
               ...(draft.entities ? { entities: draft.entities } : {}),
+              ...(includeFilesButton
+                ? {
+                    reply_markup: new InlineKeyboard().text(
+                      "📦 Получить все новые файлы",
+                      "dla"
+                    ),
+                  }
+                : {}),
             });
           }
         );
