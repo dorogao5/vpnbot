@@ -39,14 +39,12 @@ type PendingInput =
   | { kind: "rename"; configId: string }
   | { kind: "date"; target: DateTarget }
   | { kind: "broadcast" }
-  | { kind: "bypass-domain-add" }
   | { kind: "server-add" }
   | { kind: "server-rename"; serverKey: ServerKey };
 
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
 const CONFIG_PAGE_SIZE = 10;
-const DOMAIN_PAGE_SIZE = 8;
 const MASS_EXTENSION_PERIODS = {
   "7d": { label: "7 дней", duration: { days: 7 } },
   "1m": { label: "1 месяц", duration: { months: 1 } },
@@ -183,26 +181,6 @@ export function createBot(
           .row()
           .text("❌ Отменить", "bca"),
       });
-      return;
-    }
-
-    if (pending.kind === "bypass-domain-add") {
-      if (!isAdmin(ctx, appConfig)) return;
-      const values = ctx.message.text.split(/[\s,]+/).filter(Boolean);
-      try {
-        const added = await db.addBypassDomains(values);
-        await ctx.reply(
-          added > 0
-            ? `✅ Добавлено доменов: ${added}. Чтобы правило появилось в существующем конфиге, его нужно скачать заново.`
-            : "Эти домены уже находятся в белом списке.",
-          { reply_markup: new InlineKeyboard().text("🌐 К белому списку", "wd") }
-        );
-      } catch (error) {
-        pendingInputs.set(telegramId, pending);
-        await ctx.reply(error instanceof Error ? error.message : String(error), {
-          reply_markup: new InlineKeyboard().text("❌ Отмена", "wd"),
-        });
-      }
       return;
     }
 
@@ -665,55 +643,6 @@ export function createBot(
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     await ctx.answerCallbackQuery({ text: "Обновляю статистику…" });
     await showTrafficStats(ctx, trafficService, serverManager);
-  });
-
-  bot.callbackQuery("wd", async (ctx) => {
-    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    pendingInputs.delete(String(ctx.from.id));
-    await ctx.answerCallbackQuery();
-    await showBypassDomains(ctx, db, 0);
-  });
-
-  bot.callbackQuery(/^wdp\|(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    await ctx.answerCallbackQuery();
-    await showBypassDomains(ctx, db, Number(ctx.match[1]));
-  });
-
-  bot.callbackQuery("wda", async (ctx) => {
-    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    pendingInputs.set(String(ctx.from.id), { kind: "bypass-domain-add" });
-    await ctx.answerCallbackQuery();
-    await edit(
-      ctx,
-      "➕ Отправьте домены одним сообщением — по одному в строке либо через пробел/запятую.\n\nУказывайте точные имена без https:// и пути. Для example.com и www.example.com нужны две отдельные записи.",
-      new InlineKeyboard().text("❌ Отмена", "wd")
-    );
-  });
-
-  bot.callbackQuery(/^wdr\|(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    const id = Number(ctx.match[1]);
-    const entry = (await db.listBypassDomains()).find((item) => item.id === id);
-    if (!entry) return showAlert(ctx, "Домен уже удалён.");
-    await ctx.answerCallbackQuery();
-    await edit(
-      ctx,
-      `Удалить ${entry.domain} из белого списка?`,
-      new InlineKeyboard()
-        .text("🗑 Удалить", `wdc|${entry.id}`)
-        .row()
-        .text("❌ Отмена", "wd")
-    );
-  });
-
-  bot.callbackQuery(/^wdc\|(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
-    const deleted = await db.deleteBypassDomain(Number(ctx.match[1]));
-    await ctx.answerCallbackQuery({
-      text: deleted ? "Домен удалён." : "Домен уже был удалён.",
-    });
-    await showBypassDomains(ctx, db, 0);
   });
 
   bot.callbackQuery("ax", async (ctx) => {
@@ -1437,8 +1366,6 @@ async function showAdminMain(
       .row()
       .text("🖥 Серверы", "sv")
       .row()
-      .text("🌐 Белые домены", "wd")
-      .row()
       .text("📣 Рассылка", "bc")
       .row()
       .text("⏳ Продлить все конфиги", "ax")
@@ -1447,45 +1374,6 @@ async function showAdminMain(
       .row()
       .text("🏠 Главное меню", "m")
   );
-}
-
-async function showBypassDomains(
-  ctx: Context,
-  db: AppDatabase,
-  requestedPage: number
-): Promise<void> {
-  const domains = await db.listBypassDomains();
-  const pages = Math.max(1, Math.ceil(domains.length / DOMAIN_PAGE_SIZE));
-  const page = Math.min(Math.max(0, requestedPage), pages - 1);
-  const start = page * DOMAIN_PAGE_SIZE;
-  const visible = domains.slice(start, start + DOMAIN_PAGE_SIZE);
-  const keyboard = new InlineKeyboard();
-  for (const entry of visible) {
-    const label = entry.domain.length > 48
-      ? `${entry.domain.slice(0, 45)}…`
-      : entry.domain;
-    keyboard.text(`🗑 ${label}`, `wdr|${entry.id}`).row();
-  }
-  if (pages > 1) {
-    if (page > 0) keyboard.text("⬅️", `wdp|${page - 1}`);
-    keyboard.text(`${page + 1}/${pages}`, `wdp|${page}`);
-    if (page + 1 < pages) keyboard.text("➡️", `wdp|${page + 1}`);
-    keyboard.row();
-  }
-  keyboard
-    .text("➕ Добавить домены", "wda")
-    .row()
-    .text("⬅️ Админ-панель", "a");
-  const lines = [
-    "🌐 Белые домены",
-    "",
-    "Эти сайты открываются напрямую через обычный шлюз пользователя, минуя VPN.",
-    "После изменения списка конфиг нужно скачать заново.",
-    "Для домена и его поддоменов нужны отдельные записи.",
-    "",
-    domains.length ? `Всего доменов: ${domains.length}` : "Список пока пуст.",
-  ];
-  await edit(ctx, lines.join("\n"), keyboard);
 }
 
 async function showTrafficStats(

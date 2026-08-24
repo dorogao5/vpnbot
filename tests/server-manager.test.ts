@@ -27,7 +27,7 @@ const appConfig: AppConfig = {
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtest vpnbot-bootstrap",
   telegramProxyUrl: undefined,
   sshProxyUrl: undefined,
-  vpnProfile: { relay: undefined, bypassRoutes: [], bypassDomains: [], blockIpv6: false },
+  vpnProfile: { relay: undefined, blockIpv6: false },
   relayProvisioning: {
     host: "relay.example.com",
     publicHost: "relay.example.com",

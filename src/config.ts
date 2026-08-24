@@ -31,8 +31,6 @@ const schema = z.object({
   VPN_RELAY_SSH_USER: z.string().default("vpn-relay"),
   VPN_RELAY_TUNNEL_PRIVATE_KEY_PATH: optionalString,
   VPN_RELAY_HOST_PUBLIC_KEY_PATH: optionalString,
-  VPN_BYPASS_ROUTES: z.string().default(""),
-  VPN_BYPASS_DOMAINS: z.string().default(""),
   VPN_BLOCK_IPV6: z
     .enum(["true", "false"])
     .default("true")
@@ -65,8 +63,6 @@ export interface VpnServerConfig {
 
 export interface VpnProfileOptions {
   relay: { host: string; port: number } | undefined;
-  bypassRoutes: string[];
-  bypassDomains: string[];
   blockIpv6: boolean;
 }
 
@@ -153,14 +149,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       "Для автоматического relay нужны VPN_RELAY_HOST, VPN_RELAY_SSH_HOST (или тот же host), VPN_RELAY_TUNNEL_PRIVATE_KEY_PATH и VPN_RELAY_HOST_PUBLIC_KEY_PATH"
     );
   }
-  const bypassRoutes = parsed.VPN_BYPASS_ROUTES
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const bypassDomains = parsed.VPN_BYPASS_DOMAINS
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
   const newServer = serverFromEnv(
     "new",
     parsed.NEW_VPN_NAME,
@@ -201,8 +189,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       relay: parsed.VPN_RELAY_HOST && parsed.VPN_RELAY_PORT
         ? { host: parsed.VPN_RELAY_HOST, port: parsed.VPN_RELAY_PORT }
         : undefined,
-      bypassRoutes,
-      bypassDomains,
       blockIpv6: parsed.VPN_BLOCK_IPV6,
     },
     relayProvisioning: hasAllRelayProvisioning

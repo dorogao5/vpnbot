@@ -42,8 +42,6 @@ export class ConfigService {
     private readonly servers: ServerResolver,
     private readonly profileOptions: VpnProfileOptions = {
       relay: undefined,
-      bypassRoutes: [],
-      bypassDomains: [],
       blockIpv6: false,
     }
   ) {}
@@ -315,15 +313,9 @@ export class ConfigService {
   }
 
   private async profileOptionsFor(target: VpnServerTarget): Promise<VpnProfileOptions> {
-    const databaseDomains = (await this.db.listBypassDomains())
-      .map((entry) => entry.domain);
     return {
       ...this.profileOptions,
       relay: target.relay ?? this.profileOptions.relay,
-      bypassDomains: [...new Set([
-        ...this.profileOptions.bypassDomains,
-        ...databaseDomains,
-      ])],
     };
   }
 

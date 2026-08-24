@@ -98,17 +98,6 @@ afterEach(async () => {
 });
 
 describe("ConfigService", () => {
-  it("добавляет домены из БД в повторно скачанный профиль", async () => {
-    await db.addBypassDomains(["Direct.Example"]);
-    const user = await db.upsertUser({ telegramId: "domain", firstName: "Domain" });
-    const config = await service.issue(user, "2027-01-01T20:59:59.999Z");
-
-    const file = await service.download(config);
-    expect(file.toString("utf8")).toContain(
-      "route direct.example 255.255.255.255 net_gateway"
-    );
-  });
-
   it("подставляет relay-порт именно того сервера, где лежит конфиг", async () => {
     resolver.relays.set("new", { host: "198.51.100.10", port: 4443 });
     vpn.enabled.set("old", false);

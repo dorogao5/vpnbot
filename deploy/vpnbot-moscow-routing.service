@@ -1,0 +1,13 @@
+[Unit]
+Description=Geo-aware routing for VPN clients terminated in Moscow
+After=network-online.target wg-quick@wg-vpnbot.service openvpn-server@server-tcp.service docker.service
+Wants=network-online.target wg-quick@wg-vpnbot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-moscow-routing up
+ExecStop=/usr/local/sbin/vpnbot-moscow-routing down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -9,7 +9,6 @@ import type {
 import { PrismaClient } from "./generated/prisma/client.js";
 import type {
   CompletedTrafficSession,
-  BypassDomainRecord,
   LegacyClientRecord,
   PendingRevocationRecord,
   ServerKey,
@@ -18,7 +17,6 @@ import type {
   VpnConfigRecord,
   VpnServerRecord,
 } from "./domain.js";
-import { normalizeBypassDomain } from "./bypass-domain.js";
 
 function mapUser(row: User): UserRecord {
   return {
@@ -683,32 +681,6 @@ export class AppDatabase {
   }): Promise<VpnServerRecord> {
     const row = await this.prisma.vpnServer.update({ where: { key }, data });
     return mapServer(row);
-  }
-
-  async listBypassDomains(): Promise<BypassDomainRecord[]> {
-    const rows = await this.prisma.bypassDomain.findMany({
-      orderBy: { domain: "asc" },
-    });
-    return rows.map((row) => ({
-      id: row.id,
-      domain: row.domain,
-      createdAt: row.createdAt.toISOString(),
-    }));
-  }
-
-  async addBypassDomains(values: string[]): Promise<number> {
-    const domains = [...new Set(values.map(normalizeBypassDomain))];
-    if (domains.length === 0) throw new Error("Укажите хотя бы один домен");
-    const result = await this.prisma.bypassDomain.createMany({
-      data: domains.map((domain) => ({ domain })),
-      skipDuplicates: true,
-    });
-    return result.count;
-  }
-
-  async deleteBypassDomain(id: number): Promise<boolean> {
-    const result = await this.prisma.bypassDomain.deleteMany({ where: { id } });
-    return result.count > 0;
   }
 
   async deleteServer(key: string): Promise<{

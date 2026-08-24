@@ -53,12 +53,6 @@ export interface VpnServerRecord {
   updatedAt: string;
 }
 
-export interface BypassDomainRecord {
-  id: number;
-  domain: string;
-  createdAt: string;
-}
-
 export interface ServerTraffic {
   uploadBytes: number;
   downloadBytes: number;

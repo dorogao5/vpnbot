@@ -15,19 +15,6 @@ afterEach(async () => {
 });
 
 describe("AppDatabase с Prisma", () => {
-  it("нормализует, хранит и удаляет белые домены", async () => {
-    expect(await db.addBypassDomains(["Example.COM", "пример.рф", "example.com"])).toBe(2);
-    const domains = await db.listBypassDomains();
-    expect(domains.map((entry) => entry.domain)).toEqual([
-      "example.com",
-      "xn--e1afmkfd.xn--p1ai",
-    ]);
-    expect(await db.deleteBypassDomain(domains[0]!.id)).toBe(true);
-    expect((await db.listBypassDomains()).map((entry) => entry.domain)).toEqual([
-      "xn--e1afmkfd.xn--p1ai",
-    ]);
-  });
-
   it("обновляет username зарегистрированного пользователя", async () => {
     const first = await db.upsertUser({ telegramId: "100", username: "old", firstName: "Иван" });
     const updated = await db.upsertUser({ telegramId: "100", username: "new", firstName: "Иван" });

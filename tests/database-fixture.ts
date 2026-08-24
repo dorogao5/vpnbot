@@ -6,7 +6,6 @@ const databaseUrl = process.env.TEST_DATABASE_URL
 export async function createCleanDatabase(): Promise<AppDatabase> {
   const db = new AppDatabase(databaseUrl);
   await db.prisma.$transaction([
-    db.prisma.bypassDomain.deleteMany(),
     db.prisma.pendingRevocation.deleteMany(),
     db.prisma.trafficEvent.deleteMany(),
     db.prisma.notification.deleteMany(),

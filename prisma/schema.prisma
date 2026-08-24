@@ -147,11 +147,3 @@ model VpnServer {
 
   @@map("vpn_servers")
 }
-
-model BypassDomain {
-  id        Int      @id @default(autoincrement())
-  domain    String   @unique @db.VarChar(253)
-  createdAt DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
-
-  @@map("bypass_domains")
-}
