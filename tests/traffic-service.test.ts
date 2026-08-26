@@ -144,6 +144,22 @@ describe("TrafficService", () => {
     expect(totals.servers.old).toBeUndefined();
   });
 
+  it("оставляет трафик удалённого сервера только в общем итоге", async () => {
+    await db.importTrafficEvents("old", [
+      trafficEvent("historical_old", "oldclient", 1000),
+    ]);
+
+    const totals = await service.all();
+
+    expect(totals.total).toEqual({
+      uploadBytes: 100,
+      downloadBytes: 200,
+      totalBytes: 300,
+    });
+    expect(totals.servers.old).toBeUndefined();
+    expect(totals.servers.new).toBeDefined();
+  });
+
   it("показывает активные подключения даже при ошибке импорта истории", async () => {
     gateway.snapshot = {
       completed: [trafficEvent("failed_import", config.clientName, 1000)],

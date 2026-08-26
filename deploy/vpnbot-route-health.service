@@ -1,0 +1,7 @@
+[Unit]
+Description=Check Finland egress and update VPN policy route
+After=wg-quick@wg-vpnbot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-route-health

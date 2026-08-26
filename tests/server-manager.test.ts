@@ -25,6 +25,19 @@ const appConfig: AppConfig = {
   helperCommand: "sudo /usr/local/sbin/openvpn-bot-helper",
   bootstrapPublicKey:
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtest vpnbot-bootstrap",
+  telegramProxyUrl: undefined,
+  sshProxyUrl: undefined,
+  vpnProfile: { relay: undefined, blockIpv6: false },
+  relayProvisioning: {
+    host: "relay.example.com",
+    publicHost: "relay.example.com",
+    port: 22,
+    username: "vpn-relay",
+    privateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----",
+    hostPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtest relay",
+    portStart: 4443,
+    portEnd: 4499,
+  },
   envServers: {},
 };
 
@@ -62,6 +75,7 @@ describe("ServerManager", () => {
     expect(created.key).toBe("srv_4");
     expect(created.status).toBe("pending");
     expect(created.enabled).toBe(false);
+    expect(created.relayPort).toBe(4443);
 
     // завершаем зависший bootstrap, чтобы тест не держал соединение
     manager.onBootstrapFinished = undefined;
@@ -135,10 +149,14 @@ describe("ServerManager", () => {
 
     const targets = await manager.usableTargets();
     expect(targets.map((target) => target.key)).toEqual(["new"]);
+    await expect(manager.resolveTarget("srv_1")).resolves.toBeNull();
 
     await db.updateServer("srv_1", { enabled: true });
     const after = await manager.usableTargets();
     expect(after.map((target) => target.key).sort()).toEqual(["new", "srv_1"]);
+    await expect(manager.resolveTarget("srv_1")).resolves.toMatchObject({
+      key: "srv_1",
+    });
   });
 
   it("возвращает displayName сервера с приоритетом БД", async () => {

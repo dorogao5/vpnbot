@@ -51,7 +51,15 @@ export class ServerManager {
   }
 
   async resolveTarget(serverKey: string): Promise<VpnServerTarget | null> {
-    return (await this.getServer(serverKey))?.target ?? null;
+    const server = await this.getServer(serverKey);
+    if (
+      !server ||
+      !server.record.enabled ||
+      server.record.status !== "ready"
+    ) {
+      return null;
+    }
+    return server.target;
   }
 
   async usableTargets(): Promise<VpnServerTarget[]> {
@@ -83,6 +91,24 @@ export class ServerManager {
     return this.gateway.listClients(target);
   }
 
+  async deleteServer(serverKey: string): Promise<{
+    configs: number;
+    legacyClients: number;
+    pendingRevocations: number;
+  }> {
+    if (this.gateway.isConfigured(serverKey)) {
+      throw new Error(
+        "Этот сервер задан через .env. Сначала удалите его параметры из окружения."
+      );
+    }
+    const record = await this.db.getServerByKey(serverKey);
+    if (record?.relayManaged) {
+      const target = this.targetFor(record);
+      if (target) await this.gateway.stopManagedRelay(target);
+    }
+    return this.db.deleteServer(serverKey);
+  }
+
   async addServer(input: {
     host: string;
     port: number;
@@ -102,10 +128,16 @@ export class ServerManager {
       throw new Error(
         "Не задан VPN_BOOTSTRAP_PUBLIC_KEY_PATH — публичный ключ для новых серверов"
       );
+    if (!this.config.relayProvisioning)
+      throw new Error("Не настроен автоматический relay для новых серверов");
     if (await this.db.getServerByHost(host))
       throw new Error("Сервер с таким адресом уже добавлен");
 
     const sshKey = await this.nextServerKey();
+    const relayPort = await this.db.nextRelayPort(
+      this.config.relayProvisioning.portStart,
+      this.config.relayProvisioning.portEnd
+    );
     const server = await this.db.createServerPlaceholder({
       key: sshKey,
       name: input.name,
@@ -114,6 +146,8 @@ export class ServerManager {
       sshUser: "vpn-bot",
       sshPrivateKey: "",
       hostFingerprint: "pending",
+      relayPort,
+      relayManaged: true,
     });
 
     const notify = this.onBootstrapFinished;
@@ -123,7 +157,7 @@ export class ServerManager {
         if (!updated) return;
         if (updated.status === "ready") {
           notify?.(
-            `✅ Сервер «${updated.name}» готов к выдаче конфигов.\n🌐 ${updated.host}:${updated.port}`
+            `✅ Сервер «${updated.name}» готов к выдаче конфигов.\n🌐 VPN relay: ${this.config.vpnProfile.relay?.host}:${updated.relayPort}`
           );
         } else {
           notify?.(
@@ -159,7 +193,12 @@ export class ServerManager {
 
     let script: string;
     try {
-      script = renderBootstrapScript(this.config.bootstrapPublicKey!)
+      if (!record.relayPort) throw new Error("Серверу не выделен relay-порт");
+      script = renderBootstrapScript(
+        this.config.bootstrapPublicKey!,
+        this.config.relayProvisioning!,
+        record.relayPort
+      )
         .replaceAll("\\$", "$");
     } catch (error) {
       await fail(error);
@@ -174,6 +213,7 @@ export class ServerManager {
           port: record.port,
           username: "root",
           password: rootPassword,
+          proxyUrl: this.config.sshProxyUrl,
           timeoutMs: 600_000,
         },
         `bash -se <<'VPNBOT_BOOTSTRAP_EOF'\n${script.replaceAll("SRV_KEY_PLACEHOLDER", serverKey)}\nVPNBOT_BOOTSTRAP_EOF\n`
@@ -189,6 +229,7 @@ export class ServerManager {
         sshPrivateKey: result.privateKey,
         hostFingerprint: result.fingerprint,
         status: "ready",
+        enabled: true,
         lastError: null,
       });
     } catch (error) {
@@ -208,6 +249,15 @@ export class ServerManager {
       privateKey: record.sshPrivateKey,
       hostFingerprint: record.hostFingerprint,
       helperCommand: this.config.helperCommand,
+      proxyUrl: this.config.sshProxyUrl,
+      ...(this.config.vpnProfile.relay
+        ? {
+            relay: {
+              host: this.config.vpnProfile.relay.host,
+              port: record.relayPort ?? this.config.vpnProfile.relay.port,
+            },
+          }
+        : {}),
     };
   }
 
@@ -221,6 +271,8 @@ export class ServerManager {
       sshUser: "vpn-bot",
       sshPrivateKey: "",
       hostFingerprint: "",
+      relayPort: null,
+      relayManaged: false,
       status: "ready",
       enabled: true,
       isBuiltin: true,
@@ -239,11 +291,32 @@ export class ServerManager {
   }
 }
 
-function renderBootstrapScript(publicKey: string): string {
+function renderBootstrapScript(
+  publicKey: string,
+  relay: NonNullable<AppConfig["relayProvisioning"]>,
+  relayPort: number
+): string {
   if (!/^ssh-(ed25519|rsa|ecdsa-sha2-nistp256) \S+( \S+)?$/.test(publicKey))
     throw new Error("Некорректный публичный SSH-ключ в конфигурации бота");
   const keyComment = publicKey.split(/\s+/).slice(2).join(" ") || "";
   const keyLine = keyComment ? publicKey : `${publicKey} vpnbot`;
+  if (!/^[0-9A-Za-z.-]{1,253}$/.test(relay.host))
+    throw new Error("Некорректный SSH-адрес relay-сервера");
+  if (!/^[0-9A-Za-z.-]{1,253}$/.test(relay.publicHost))
+    throw new Error("Некорректный публичный адрес relay-сервера");
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(relay.username))
+    throw new Error("Некорректный SSH-пользователь relay-сервера");
+  if (!/^-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+-----END [A-Z ]*PRIVATE KEY-----$/.test(relay.privateKey))
+    throw new Error("Некорректный приватный ключ relay-туннеля");
+  const relayHostKey = relay.hostPublicKey.match(
+    /(?:^|\s)(ssh-(?:ed25519|rsa)|ecdsa-sha2-nistp256)\s+(\S+)/
+  );
+  if (!relayHostKey)
+    throw new Error("Некорректный публичный host key relay-сервера");
+  const relayKeyBase64 = Buffer.from(`${relay.privateKey}\n`).toString("base64");
+  const knownHostsBase64 = Buffer.from(
+    `vpnbot-relay ${relayHostKey[1]} ${relayHostKey[2]}\n`
+  ).toString("base64");
   return `set -Eeuo pipefail
 
 SRV_KEY="SRV_KEY_PLACEHOLDER"
@@ -269,13 +342,23 @@ BOT_PUB_LINE="\\$(cat "\\$BOT_KEY_PATH.pub")"
 if [[ ! -x /usr/local/sbin/openvpn-bot-helper ]]; then
   if [[ ! -x /etc/openvpn/server/easy-rsa/easyrsa ]]; then
     cd /root
-    curl -fsSL https://git.io/vpn -o openvpn-install.sh
+    curl -fsSL https://raw.githubusercontent.com/hwdsl2/openvpn-install/5aeec9eac6e663a5908f56c971d9278dd861c66e/openvpn-install.sh -o openvpn-install.sh
     chmod +x openvpn-install.sh
-    AUTO_INSTALL=y bash openvpn-install.sh
+    bash openvpn-install.sh --auto --proto TCP --port 1194 --clientname vpnbot-bootstrap --dns1 1.1.1.1 --dns2 1.0.0.1
   fi
   curl -fsSL https://raw.githubusercontent.com/Ralf303/vpnbot/main/deploy/openvpn-bot-helper -o /usr/local/sbin/openvpn-bot-helper
   chmod 0755 /usr/local/sbin/openvpn-bot-helper
 fi
+
+grep -Eq '^proto (tcp|tcp-server)$' /etc/openvpn/server/server.conf || {
+  echo 'Существующий OpenVPN настроен не на TCP' >&2
+  exit 1
+}
+grep -Eq '^port 1194$' /etc/openvpn/server/server.conf || {
+  echo 'Существующий OpenVPN использует порт, отличный от 1194' >&2
+  exit 1
+}
+/usr/local/sbin/openvpn-bot-helper revoke vpnbot-bootstrap >/dev/null 2>&1 || true
 
 curl -fsSL https://raw.githubusercontent.com/Ralf303/vpnbot/main/deploy/openvpn-traffic-disconnect -o /usr/local/sbin/openvpn-traffic-disconnect
 chmod 0755 /usr/local/sbin/openvpn-traffic-disconnect
@@ -297,13 +380,43 @@ echo '${keyLine}' >> /home/vpn-bot/.ssh/authorized_keys
 chmod 0600 /home/vpn-bot/.ssh/authorized_keys
 chown vpn-bot:vpn-bot /home/vpn-bot/.ssh/authorized_keys
 
-printf 'vpn-bot ALL=(root) NOPASSWD: /usr/local/sbin/openvpn-bot-helper\\n' > /etc/sudoers.d/vpn-bot
+printf 'vpn-bot ALL=(root) NOPASSWD: /usr/local/sbin/openvpn-bot-helper\\nvpn-bot ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpnbot-relay-tunnel.service\\n' > /etc/sudoers.d/vpn-bot
 chmod 0440 /etc/sudoers.d/vpn-bot
 visudo -cf /etc/sudoers.d/vpn-bot >/dev/null
+
+install -d -m 0700 /etc/vpnbot-relay
+echo '${relayKeyBase64}' | base64 -d > /etc/vpnbot-relay/id_ed25519
+echo '${knownHostsBase64}' | base64 -d > /etc/vpnbot-relay/known_hosts
+chmod 0600 /etc/vpnbot-relay/id_ed25519 /etc/vpnbot-relay/known_hosts
+
+cat > /etc/systemd/system/vpnbot-relay-tunnel.service <<'RELAY_UNIT'
+[Unit]
+Description=VPN bot reverse relay tunnel
+After=network-online.target openvpn-server@server.service
+Wants=network-online.target
+Requires=openvpn-server@server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT -4 -p ${relay.port} -i /etc/vpnbot-relay/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o HostKeyAlias=vpnbot-relay -o UserKnownHostsFile=/etc/vpnbot-relay/known_hosts -R 0.0.0.0:${relayPort}:127.0.0.1:1194 ${relay.username}@${relay.host}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+RELAY_UNIT
+
+systemctl daemon-reload
+systemctl enable --now vpnbot-relay-tunnel.service
+sleep 3
+systemctl is-active --quiet vpnbot-relay-tunnel.service
+timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1194'
+timeout 10 bash -c 'exec 3<>/dev/tcp/${relay.publicHost}/${relayPort}'
 
 FP="\\$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256 | awk '{print \\$2}')"
 echo "===VPNBOT-RESULT==="
 echo "fingerprint=\\$FP"
+echo "relay_port=${relayPort}"
 echo "-----BEGIN OPENSSH PRIVATE KEY-----"
 cat "\\$BOT_KEY_PATH"
 echo "-----END OPENSSH PRIVATE KEY-----"

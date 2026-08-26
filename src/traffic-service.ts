@@ -163,10 +163,15 @@ export class TrafficService {
     );
     const completed = await this.db.completedTrafficByServer();
     const servers: Record<ServerKey, ServerTrafficUsage> = {};
-    let total: ServerTraffic = { uploadBytes: 0, downloadBytes: 0 };
-    for (const serverKey of [
-      ...new Set([...Object.keys(completed), ...targets.map((t) => t.key)]),
-    ]) {
+    // Completed events are retained as historical data after a server is
+    // removed. They still belong in the all-time total, but must not turn a
+    // deleted server into a current server section in the admin UI.
+    let total: ServerTraffic = Object.values(completed).reduce(
+      add,
+      { uploadBytes: 0, downloadBytes: 0 }
+    );
+    for (const target of targets) {
+      const serverKey = target.key;
       const completedTraffic = completed[serverKey] ?? {
         uploadBytes: 0,
         downloadBytes: 0,
@@ -177,7 +182,6 @@ export class TrafficService {
         activeConnections: active.length,
         liveAvailable: liveAvailable.get(serverKey) ?? false,
       };
-      total = add(total, completedTraffic);
       total = add(total, sumActive(active));
     }
     return { total: usage(total), servers };

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily update of Russian IPv4 prefixes
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=15m
+Unit=vpnbot-update-ru-routes.service
+
+[Install]
+WantedBy=timers.target

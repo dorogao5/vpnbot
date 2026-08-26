@@ -24,6 +24,8 @@ export interface VpnServerTarget {
   privateKey: string | Buffer;
   hostFingerprint: string;
   helperCommand: string;
+  proxyUrl: string | undefined;
+  relay?: { host: string; port: number };
 }
 
 export class OpenVpnGateway {
@@ -100,6 +102,19 @@ export class OpenVpnGateway {
     return parseTrafficSnapshot(output).active;
   }
 
+  async stopManagedRelay(server: VpnServerTarget): Promise<void> {
+    await runSshCommand({
+      host: server.host,
+      port: server.port,
+      username: server.username,
+      privateKey: server.privateKey,
+      hostFingerprint: server.hostFingerprint,
+      command: "sudo /usr/bin/systemctl disable --now vpnbot-relay-tunnel.service",
+      proxyUrl: server.proxyUrl,
+      timeoutMs: 30_000,
+    });
+  }
+
   private async execute(server: VpnServerTarget, args: string[]): Promise<Buffer> {
     const command = [server.helperCommand, ...args].join(" ");
     return runSshCommand({
@@ -109,6 +124,7 @@ export class OpenVpnGateway {
       privateKey: server.privateKey,
       hostFingerprint: server.hostFingerprint,
       command,
+      proxyUrl: server.proxyUrl,
       timeoutMs: 30_000,
     });
   }

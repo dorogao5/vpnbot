@@ -6,3 +6,19 @@ export function vpnFileName(clientName: string): string {
   }
   return `${clientName}.ovpn`;
 }
+
+export function labeledVpnFileName(
+  displayName: string,
+  clientName: string
+): string {
+  const technicalName = vpnFileName(clientName);
+  const safeLabel = displayName
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "")
+    .slice(0, 60)
+    .trim();
+  return safeLabel ? `${safeLabel} — ${technicalName}` : technicalName;
+}

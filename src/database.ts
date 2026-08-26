@@ -1,4 +1,5 @@
 import { PrismaPg } from "@prisma/adapter-pg";
+import { DateTime } from "luxon";
 import type {
   User,
   VpnConfig,
@@ -65,6 +66,8 @@ function mapServer(row: VpnServer): VpnServerRecord {
     sshUser: row.sshUser,
     sshPrivateKey: row.sshPrivateKey,
     hostFingerprint: row.hostFingerprint,
+    relayPort: row.relayPort,
+    relayManaged: row.relayManaged,
     status: row.status,
     enabled: row.enabled,
     isBuiltin: row.isBuiltin,
@@ -237,6 +240,36 @@ export class AppDatabase {
         revokedAt: null,
       },
     });
+  }
+
+  async countExtendableConfigs(): Promise<number> {
+    return this.prisma.vpnConfig.count({
+      where: { status: "active", revokedAt: null },
+    });
+  }
+
+  async extendAllActiveConfigs(
+    period: { days?: number; months?: number; years?: number }
+  ): Promise<number> {
+    const configs = await this.prisma.vpnConfig.findMany({
+      where: { status: "active", revokedAt: null },
+      select: { id: true, expiresAt: true },
+    });
+    if (configs.length === 0) return 0;
+
+    await this.prisma.$transaction(
+      configs.map(({ id, expiresAt }) => {
+        const extended = DateTime.fromJSDate(expiresAt, { zone: "utc" }).plus(period);
+        return this.prisma.vpnConfig.update({
+          where: { id },
+          data: {
+            expiresAt: extended.toJSDate(),
+            hiddenAt: extended.plus({ days: 10 }).toJSDate(),
+          },
+        });
+      })
+    );
+    return configs.length;
   }
 
   async replaceClient(
@@ -611,6 +644,8 @@ export class AppDatabase {
     sshUser: string;
     sshPrivateKey: string;
     hostFingerprint: string;
+    relayPort?: number;
+    relayManaged?: boolean;
   }): Promise<VpnServerRecord> {
     const row = await this.prisma.vpnServer.create({
       data: {
@@ -621,6 +656,8 @@ export class AppDatabase {
         sshUser: input.sshUser,
         sshPrivateKey: input.sshPrivateKey,
         hostFingerprint: input.hostFingerprint,
+        relayPort: input.relayPort ?? null,
+        relayManaged: input.relayManaged ?? true,
         status: "pending",
         enabled: false,
         isBuiltin: false,
@@ -636,6 +673,8 @@ export class AppDatabase {
     sshUser?: string;
     sshPrivateKey?: string;
     hostFingerprint?: string;
+    relayPort?: number | null;
+    relayManaged?: boolean;
     enabled?: boolean;
     status?: "ready" | "pending" | "error";
     lastError?: string | null;
@@ -644,16 +683,97 @@ export class AppDatabase {
     return mapServer(row);
   }
 
-  async maxDynamicServerId(): Promise<number> {
-    const rows = await this.prisma.vpnServer.findMany({
-      where: { key: { startsWith: "srv_" } },
-      select: { key: true },
+  async deleteServer(key: string): Promise<{
+    configs: number;
+    legacyClients: number;
+    pendingRevocations: number;
+  }> {
+    return this.prisma.$transaction(async (tx) => {
+      const server = await tx.vpnServer.findUnique({
+        where: { key },
+        select: { key: true },
+      });
+      if (!server) throw new Error("Сервер не найден");
+      const [configs, legacyClients, pendingRevocations] = await Promise.all([
+        tx.vpnConfig.count({ where: { serverKey: key } }),
+        tx.legacyClient.count({ where: { serverKey: key } }),
+        tx.pendingRevocation.count({ where: { serverKey: key } }),
+      ]);
+      await tx.pendingRevocation.deleteMany({ where: { serverKey: key } });
+      await tx.legacyClient.deleteMany({ where: { serverKey: key } });
+      await tx.vpnServer.delete({ where: { key } });
+      return { configs, legacyClients, pendingRevocations };
     });
+  }
+
+  async serverDeletionImpact(key: string): Promise<{
+    configs: number;
+    legacyClients: number;
+    pendingRevocations: number;
+  }> {
+    const [configs, legacyClients, pendingRevocations] = await Promise.all([
+      this.prisma.vpnConfig.count({ where: { serverKey: key } }),
+      this.prisma.legacyClient.count({ where: { serverKey: key } }),
+      this.prisma.pendingRevocation.count({ where: { serverKey: key } }),
+    ]);
+    return { configs, legacyClients, pendingRevocations };
+  }
+
+  async maxDynamicServerId(): Promise<number> {
+    const [servers, configs, legacyClients, trafficEvents, pendingRevocations] =
+      await Promise.all([
+      this.prisma.vpnServer.findMany({
+        where: { key: { startsWith: "srv_" } },
+        select: { key: true },
+      }),
+      this.prisma.vpnConfig.findMany({
+        where: { serverKey: { startsWith: "srv_" } },
+        distinct: ["serverKey"],
+        select: { serverKey: true },
+      }),
+      this.prisma.legacyClient.findMany({
+        where: { serverKey: { startsWith: "srv_" } },
+        distinct: ["serverKey"],
+        select: { serverKey: true },
+      }),
+      this.prisma.trafficEvent.findMany({
+        where: { serverKey: { startsWith: "srv_" } },
+        distinct: ["serverKey"],
+        select: { serverKey: true },
+      }),
+      this.prisma.pendingRevocation.findMany({
+        where: { serverKey: { startsWith: "srv_" } },
+        distinct: ["serverKey"],
+        select: { serverKey: true },
+      }),
+      ]);
+    const keys = new Set<string>();
+    for (const { key } of servers) keys.add(key);
+    for (const { serverKey } of [
+      ...configs,
+      ...legacyClients,
+      ...trafficEvents,
+      ...pendingRevocations,
+    ]) keys.add(serverKey);
     let max = 0;
-    for (const { key } of rows) {
+    for (const key of keys) {
       const value = Number(key.slice(4));
       if (Number.isSafeInteger(value) && value > max) max = value;
     }
     return max;
+  }
+
+  async nextRelayPort(start: number, end: number): Promise<number> {
+    const rows = await this.prisma.vpnServer.findMany({
+      where: { relayPort: { not: null } },
+      select: { relayPort: true },
+    });
+    const used = new Set(rows.flatMap((row) =>
+      row.relayPort === null ? [] : [row.relayPort]
+    ));
+    for (let port = start; port <= end; port += 1) {
+      if (!used.has(port)) return port;
+    }
+    throw new Error(`Нет свободных relay-портов в диапазоне ${start}–${end}`);
   }
 }
