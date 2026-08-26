@@ -2,7 +2,11 @@
 
 Бот управляет конфигами, созданными установщиком [Nyr/openvpn-install](https://github.com/Nyr/openvpn-install), через Telegram. Пользователь видит свои конфиги, срок действия и может повторно получить файл. Администратор ищет пользователей по username или Telegram ID, выдаёт конфиги, меняет сроки и отзывает доступ.
 
-Подробная схема компонентов, сетевых потоков, размещения на серверах и текущее состояние production описаны в [ARCHITECTURE.md](ARCHITECTURE.md).
+Документация проекта:
+
+- [BOT_INTERNALS.md](BOT_INTERNALS.md) — внутренняя логика бота, модель данных, жизненный цикл конфигов, меню и фоновые задания;
+- [SERVER_INFRASTRUCTURE.md](SERVER_INFRASTRUCTURE.md) — полная серверная схема и пошаговое воспроизведение на новых VPS;
+- [ARCHITECTURE.md](ARCHITECTURE.md) — компактный обзор компонентов, сетевых потоков и текущего production-состояния.
 
 ## Реализованные правила
 
@@ -104,7 +108,7 @@ docker compose -f compose.test.yaml down
 
 ## Серверный helper
 
-Интерактивное меню `openvpn-install.sh` не предназначено для автоматизации. Файл `deploy/openvpn-bot-helper` выполняет только шесть строго ограниченных операций:
+Интерактивное меню `openvpn-install.sh` не предназначено для автоматизации. Файл `deploy/openvpn-bot-helper` выполняет только семь строго ограниченных операций:
 
 - `create CLIENT` — создать сертификат и вернуть `.ovpn` в stdout;
 - `download CLIENT` — повторно собрать активный `.ovpn`;
@@ -112,6 +116,7 @@ docker compose -f compose.test.yaml down
 - `list` — вывести активные имена клиентов;
 - `stats` — вывести суммарный трафик интерфейсов `tun*` с момента их запуска.
 - `traffic-sessions` — вывести активные и завершённые VPN-сессии для накопительного учёта.
+- `active-sessions` — вывести только текущие OpenVPN-подключения из status-файла.
 
 Helper использует каталог `/etc/openvpn/server/easy-rsa`, `client-common.txt` и CRL, созданные исходным установщиком.
 Служебный сертификат OpenVPN с именем `server` явно исключён из `list` и запрещён для операций `download` и `revoke`.
