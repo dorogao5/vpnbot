@@ -37,15 +37,16 @@ describe("AppDatabase с Prisma", () => {
       firstName: "Анна",
     });
 
-    const first = await db.createConfigRequest(user.id);
-    const duplicate = await db.createConfigRequest(user.id);
+    const first = await db.createConfigRequest(user.id, "отец Саши");
+    const duplicate = await db.createConfigRequest(user.id, "другая пометка");
 
     expect(first.created).toBe(true);
+    expect(first.request.note).toBe("отец Саши");
     expect(duplicate).toEqual({ request: first.request, created: false });
     expect(await db.countPendingConfigRequests()).toBe(1);
     expect(await db.rejectConfigRequest(first.request.id)).toBe(true);
 
-    const next = await db.createConfigRequest(user.id);
+    const next = await db.createConfigRequest(user.id, null);
     expect(next.created).toBe(true);
     expect(next.request.id).not.toBe(first.request.id);
     expect(await db.claimConfigRequest(next.request.id)).toBe(true);

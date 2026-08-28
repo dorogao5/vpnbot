@@ -84,6 +84,7 @@ function mapConfigRequest(row: ConfigRequest): ConfigRequestRecord {
     id: row.id,
     userId: row.userId,
     status: row.status,
+    note: row.note,
     configId: row.configId,
     requestedAt: row.requestedAt.toISOString(),
     resolvedAt: row.resolvedAt?.toISOString() ?? null,
@@ -169,12 +170,14 @@ export class AppDatabase {
     return rows.map(({ telegramId }) => telegramId);
   }
 
-  async createConfigRequest(userId: number): Promise<{
+  async createConfigRequest(userId: number, note: string | null): Promise<{
     request: ConfigRequestRecord;
     created: boolean;
   }> {
     try {
-      const row = await this.prisma.configRequest.create({ data: { userId } });
+      const row = await this.prisma.configRequest.create({
+        data: { userId, note },
+      });
       return { request: mapConfigRequest(row), created: true };
     } catch (error) {
       const existing = await this.prisma.configRequest.findFirst({
@@ -185,6 +188,16 @@ export class AppDatabase {
         return { request: mapConfigRequest(existing), created: false };
       throw error;
     }
+  }
+
+  async getOpenConfigRequestForUser(
+    userId: number
+  ): Promise<ConfigRequestRecord | null> {
+    const row = await this.prisma.configRequest.findFirst({
+      where: { userId, status: { in: ["pending", "processing"] } },
+      orderBy: { requestedAt: "desc" },
+    });
+    return row ? mapConfigRequest(row) : null;
   }
 
   async getConfigRequest(id: number): Promise<ConfigRequestRecord | null> {

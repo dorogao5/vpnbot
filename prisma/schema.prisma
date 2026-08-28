@@ -66,6 +66,7 @@ model ConfigRequest {
   id          Int                 @id @default(autoincrement())
   userId      Int                 @map("user_id")
   status      ConfigRequestStatus @default(pending)
+  note        String?             @db.VarChar(100)
   configId    String?             @db.Uuid @map("config_id")
   requestedAt DateTime            @default(now()) @db.Timestamptz(3) @map("requested_at")
   resolvedAt  DateTime?           @db.Timestamptz(3) @map("resolved_at")

@@ -35,6 +35,7 @@ export interface ConfigRequestRecord {
   id: number;
   userId: number;
   status: ConfigRequestStatus;
+  note: string | null;
   configId: string | null;
   requestedAt: string;
   resolvedAt: string | null;

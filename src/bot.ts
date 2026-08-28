@@ -5,6 +5,7 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 import type { AppConfig } from "./config.js";
 import { broadcastText } from "./broadcast-service.js";
 import { ConfigService } from "./config-service.js";
+import { normalizeConfigRequestNote } from "./config-request.js";
 import { AppDatabase } from "./database.js";
 import type {
   ConfigRequestRecord,
@@ -40,6 +41,7 @@ type PendingInput =
   | { kind: "rename"; configId: string }
   | { kind: "date"; target: DateTarget }
   | { kind: "broadcast" }
+  | { kind: "config-request-note" }
   | { kind: "server-add" }
   | { kind: "server-rename"; serverKey: ServerKey };
 
@@ -138,6 +140,38 @@ export function createBot(
       return;
     }
     pendingInputs.delete(telegramId);
+
+    if (pending.kind === "config-request-note") {
+      if (isAdmin(ctx, appConfig)) return;
+      const note = normalizeConfigRequestNote(ctx.message.text);
+      if (!note) {
+        pendingInputs.set(telegramId, pending);
+        await ctx.reply(
+          "Пометка должна содержать от 1 до 100 символов. Напишите, кто Вы или для кого нужен конфиг, например: «отец Саши». Либо нажмите «Пропустить».",
+          {
+            reply_markup: new InlineKeyboard()
+              .text("➡️ Пропустить", "crs")
+              .row()
+              .text("❌ Отмена", "m"),
+          }
+        );
+        return;
+      }
+      const user = await db.getUserByTelegramId(telegramId);
+      if (!user) {
+        await ctx.reply("Пользователь не найден. Нажмите /start и попробуйте снова.");
+        return;
+      }
+      await submitConfigRequest(
+        ctx,
+        user,
+        note,
+        appConfig,
+        db,
+        bot
+      );
+      return;
+    }
 
     if (pending.kind === "search") {
       if (!isAdmin(ctx, appConfig)) return;
@@ -409,46 +443,49 @@ export function createBot(
   bot.callbackQuery("cr", async (ctx) => {
     if (isAdmin(ctx, appConfig))
       return showAlert(ctx, "Администратор выдаёт конфиги из админ-панели.");
+    pendingInputs.delete(String(ctx.from.id));
     const user = await db.getUserByTelegramId(String(ctx.from.id));
     if (!user) return showAlert(ctx, "Пользователь не найден.");
-
-    const { request, created } = await db.createConfigRequest(user.id);
-    await ctx.answerCallbackQuery({
-      text: created ? "Заявка отправлена." : "Заявка уже ожидает рассмотрения.",
-    });
-    if (created) {
-      const configs = await db.listConfigsForUserAdmin(user.id);
-      await bot.api
-        .sendMessage(
-          appConfig.adminTelegramId,
-          [
-            "📥 Новая заявка на VPN-конфиг",
-            "",
-            `Пользователь: ${userLabel(user)}`,
-            `Конфигов сейчас: ${configs.length}`,
-            `Отправлена: ${formatRequestTime(request, appConfig.timezone)}`,
-          ].join("\n"),
-          {
-            reply_markup: new InlineKeyboard()
-              .text("✅ Рассмотреть", `rq|${request.id}`)
-              .row()
-              .text("❌ Отклонить", `rjr|${request.id}`)
-              .row()
-              .text("📥 Все заявки", "rql"),
-          }
-        )
-        .catch(logError);
-    }
+    const existing = await db.getOpenConfigRequestForUser(user.id);
+    await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      created
-        ? "✅ Заявка отправлена администратору. Здесь появится сообщение и готовый файл после одобрения."
-        : "⏳ Ваша заявка уже ожидает решения администратора. Повторно отправлять её не нужно.",
-      new InlineKeyboard()
-        .url("💬 Связаться с администратором", appConfig.contactUrl)
-        .row()
-        .text("🏠 Главное меню", "m")
+      existing
+        ? [
+            "⏳ Ваша заявка уже ожидает решения администратора. Повторно отправлять её не нужно.",
+            "",
+            requestNoteLine(existing),
+          ].join("\n")
+        : [
+            "📝 Оставьте короткую пометку — так администратор поймёт, кто Вы.",
+            "",
+            "Например: «отец Саши», «девушка Тёмы» или «для рабочего ноутбука».",
+            "",
+            "Отправьте пометку одним сообщением, не более 100 символов. Её увидит только администратор. Если пояснение не нужно, нажмите «Пропустить».",
+          ].join("\n"),
+      existing
+        ? new InlineKeyboard()
+            .url("💬 Связаться с администратором", appConfig.contactUrl)
+            .row()
+            .text("🏠 Главное меню", "m")
+        : new InlineKeyboard()
+            .text("➡️ Пропустить", "crs")
+            .row()
+            .text("❌ Отмена", "m")
     );
+    if (!existing) pendingInputs.set(String(ctx.from.id), {
+      kind: "config-request-note",
+    });
+  });
+
+  bot.callbackQuery("crs", async (ctx) => {
+    if (isAdmin(ctx, appConfig))
+      return showAlert(ctx, "Администратор выдаёт конфиги из админ-панели.");
+    pendingInputs.delete(String(ctx.from.id));
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery({ text: "Отправляю заявку…" });
+    await submitConfigRequest(ctx, user, null, appConfig, db, bot);
   });
 
   bot.callbackQuery("ul", async (ctx) => {
@@ -731,7 +768,7 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      `📥 Заявка #${request.id}\nПользователь: ${userLabel(user)}\nСрок: ${REQUEST_PERIODS[period].label}\n\nВыберите сервер для нового конфига:`,
+      `📥 Заявка #${request.id}\nПользователь: ${userLabel(user)}\n${requestNoteLine(request)}\nСрок: ${REQUEST_PERIODS[period].label}\n\nВыберите сервер для нового конфига:`,
       keyboard
     );
   });
@@ -758,6 +795,7 @@ export function createBot(
           `📥 Подтвердите выдачу по заявке #${request.id}`,
           "",
           `Пользователь: ${userLabel(user)}`,
+          requestNoteLine(request),
           `Сервер: ${server.record.name}`,
           `Срок: ${REQUEST_PERIODS[period].label}`,
           `Действует до: ${formatDate(expiresAt, appConfig.timezone)}`,
@@ -825,6 +863,7 @@ export function createBot(
             `✅ Заявка #${requestId} одобрена`,
             "",
             `Пользователь: ${userLabel(user)}`,
+            requestNoteLine(request),
             `Конфиг: ${config.displayName}`,
             `Сервер: ${serverName}`,
             delivered
@@ -863,7 +902,7 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      `Отклонить заявку #${request.id} от ${userLabel(user)}? Пользователь получит уведомление.`,
+      `Отклонить заявку #${request.id} от ${userLabel(user)}?\n${requestNoteLine(request)}\n\nПользователь получит уведомление.`,
       new InlineKeyboard()
         .text("❌ Да, отклонить", `rjc|${request.id}`)
         .row()
@@ -1664,6 +1703,59 @@ async function showAdminMain(
   );
 }
 
+async function submitConfigRequest(
+  ctx: Context,
+  user: UserRecord,
+  note: string | null,
+  appConfig: AppConfig,
+  db: AppDatabase,
+  bot: Bot
+): Promise<void> {
+  const { request, created } = await db.createConfigRequest(user.id, note);
+  if (created) {
+    const configs = await db.listConfigsForUserAdmin(user.id);
+    await bot.api
+      .sendMessage(
+        appConfig.adminTelegramId,
+        [
+          "📥 Новая заявка на VPN-конфиг",
+          "",
+          `Пользователь: ${userLabel(user)}`,
+          requestNoteLine(request),
+          `Конфигов сейчас: ${configs.length}`,
+          `Отправлена: ${formatRequestTime(request, appConfig.timezone)}`,
+        ].join("\n"),
+        {
+          reply_markup: new InlineKeyboard()
+            .text("✅ Рассмотреть", `rq|${request.id}`)
+            .row()
+            .text("❌ Отклонить", `rjr|${request.id}`)
+            .row()
+            .text("📥 Все заявки", "rql"),
+        }
+      )
+      .catch(logError);
+  }
+  await respond(
+    ctx,
+    created
+      ? [
+          "✅ Заявка отправлена администратору. Здесь появится сообщение и готовый файл после одобрения.",
+          "",
+          requestNoteLine(request),
+        ].join("\n")
+      : [
+          "⏳ Ваша заявка уже ожидает решения администратора. Повторно отправлять её не нужно.",
+          "",
+          requestNoteLine(request),
+        ].join("\n"),
+    new InlineKeyboard()
+      .url("💬 Связаться с администратором", appConfig.contactUrl)
+      .row()
+      .text("🏠 Главное меню", "m")
+  );
+}
+
 async function showPendingRequests(
   ctx: Context,
   db: AppDatabase,
@@ -1674,7 +1766,7 @@ async function showPendingRequests(
   for (const { request, user } of requests) {
     keyboard
       .text(
-        `#${request.id} · ${compactUserLabel(user)}`,
+        requestListLabel(request, user),
         `rq|${request.id}`
       )
       .row();
@@ -1707,6 +1799,7 @@ async function showRequestPeriodMenu(
     [
       `📥 Заявка #${request.id}`,
       `Пользователь: ${userLabel(user)}`,
+      requestNoteLine(request),
       `Отправлена: ${formatRequestTime(request, timezone)}`,
       "",
       "Выберите срок действия нового конфига:",
@@ -2245,7 +2338,25 @@ function formatRequestTime(
 }
 
 function compactUserLabel(user: UserRecord): string {
-  return user.username ? `@${user.username}` : user.firstName.slice(0, 32);
+  return user.username
+    ? `@${user.username}`
+    : truncateCharacters(user.firstName, 24);
+}
+
+function requestListLabel(
+  request: ConfigRequestRecord,
+  user: UserRecord
+): string {
+  const note = request.note
+    ? ` · ${truncateCharacters(request.note, 24)}`
+    : "";
+  return `#${request.id} · ${compactUserLabel(user)}${note}`;
+}
+
+function requestNoteLine(request: ConfigRequestRecord): string {
+  return request.note
+    ? `📝 Пометка: «${request.note}»`
+    : "📝 Пометка: не указана";
 }
 
 async function deliverRequestedConfig(
@@ -2300,6 +2411,13 @@ function isAdmin(ctx: Context, config: AppConfig): boolean {
 function normalizeDisplayName(value: string): string | null {
   const name = value.replace(/\s+/g, " ").trim();
   return name.length >= 1 && name.length <= 40 ? name : null;
+}
+
+function truncateCharacters(value: string, maxLength: number): string {
+  const characters = Array.from(value);
+  return characters.length <= maxLength
+    ? value
+    : `${characters.slice(0, maxLength - 1).join("")}…`;
 }
 
 function parseFutureDate(value: string, timezone: string): string | null {

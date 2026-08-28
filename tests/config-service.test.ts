@@ -148,7 +148,7 @@ describe("ConfigService", () => {
       telegramId: "request-issue",
       firstName: "Заявитель",
     });
-    const { request } = await db.createConfigRequest(user.id);
+    const { request } = await db.createConfigRequest(user.id, "друг семьи");
     expect(await db.claimConfigRequest(request.id)).toBe(true);
 
     const issued = await service.issueForRequest(
@@ -163,6 +163,7 @@ describe("ConfigService", () => {
     expect(issued.file).toBeInstanceOf(Buffer);
     expect(await db.getConfigRequest(request.id)).toMatchObject({
       status: "approved",
+      note: "друг семьи",
       configId: config.id,
     });
     expect(await db.getConfig(config.id)).not.toBeNull();
