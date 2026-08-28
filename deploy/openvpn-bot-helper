@@ -19,6 +19,7 @@ die() {
 validate_installation() {
   [[ -x "$EASYRSA_DIR/easyrsa" ]] || die "Easy-RSA не найден"
   [[ -f "$CLIENT_COMMON" ]] || die "Шаблон client-common.txt не найден"
+  [[ -f "$OPENVPN_DIR/tc.key" ]] || die "Ключ tls-crypt не найден"
   [[ -f "$PKI_DIR/index.txt" ]] || die "Индекс PKI не найден"
 }
 
@@ -43,6 +44,9 @@ render_client() {
   local inline="$PKI_DIR/inline/private/$client.inline"
   [[ -f "$inline" ]] || die "Данные клиента не найдены"
   grep -vh '^#' "$CLIENT_COMMON" "$inline"
+  printf '<tls-crypt>\n'
+  sed -ne '/BEGIN OpenVPN Static key/,$ p' "$OPENVPN_DIR/tc.key"
+  printf '</tls-crypt>\n'
 }
 
 refresh_crl() {
