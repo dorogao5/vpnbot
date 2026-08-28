@@ -19,6 +19,13 @@ const trafficService = new TrafficService(db, vpn, serverManager);
 const { bot } = createBot(config, db, configService, trafficService, serverManager);
 const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService, serverManager);
 
+const recoveredRequests = await db.releaseProcessingConfigRequests();
+if (recoveredRequests > 0) {
+  console.warn(
+    `Возвращено в очередь незавершённых заявок: ${recoveredRequests}`
+  );
+}
+
 for (const envServer of Object.values(config.envServers)) {
   await db
     .upsertBuiltinServer({

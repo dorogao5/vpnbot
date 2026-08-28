@@ -23,6 +23,7 @@ model User {
   createdAt  DateTime    @default(now()) @db.Timestamptz(3) @map("created_at")
   updatedAt  DateTime    @updatedAt @db.Timestamptz(3) @map("updated_at")
   configs    VpnConfig[]
+  configRequests ConfigRequest[]
 
   @@index([username])
   @@map("users")
@@ -46,11 +47,34 @@ model VpnConfig {
   legacyClients  LegacyClient[]
   clientNames    ClientName[]
   trafficEvents  TrafficEvent[]
+  requests       ConfigRequest[]
 
   @@unique([serverKey, clientName])
   @@index([userId])
   @@index([status, expiresAt])
   @@map("vpn_configs")
+}
+
+enum ConfigRequestStatus {
+  pending
+  processing
+  approved
+  rejected
+}
+
+model ConfigRequest {
+  id          Int                 @id @default(autoincrement())
+  userId      Int                 @map("user_id")
+  status      ConfigRequestStatus @default(pending)
+  configId    String?             @db.Uuid @map("config_id")
+  requestedAt DateTime            @default(now()) @db.Timestamptz(3) @map("requested_at")
+  resolvedAt  DateTime?           @db.Timestamptz(3) @map("resolved_at")
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  config      VpnConfig?          @relation(fields: [configId], references: [id], onDelete: SetNull)
+
+  @@index([status, requestedAt])
+  @@index([userId])
+  @@map("config_requests")
 }
 
 model Notification {

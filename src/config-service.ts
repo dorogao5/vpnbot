@@ -48,7 +48,37 @@ export class ConfigService {
 
   async issue(user: UserRecord, expiresAt: string): Promise<VpnConfigRecord> {
     const target = await this.selectIssueTarget();
-    const { clientName } = await this.createUniqueClient(target);
+    return (await this.issueForTarget(user, expiresAt, target)).config;
+  }
+
+  async issueOnServer(
+    user: UserRecord,
+    expiresAt: string,
+    serverKey: ServerKey
+  ): Promise<VpnConfigRecord> {
+    const target = await this.servers.resolveTarget(serverKey);
+    if (!target) throw new Error("Выбранный VPN-сервер недоступен");
+    return (await this.issueForTarget(user, expiresAt, target)).config;
+  }
+
+  async issueForRequest(
+    user: UserRecord,
+    expiresAt: string,
+    serverKey: ServerKey,
+    requestId: number
+  ): Promise<{ config: VpnConfigRecord; file: Buffer }> {
+    const target = await this.servers.resolveTarget(serverKey);
+    if (!target) throw new Error("Выбранный VPN-сервер недоступен");
+    return this.issueForTarget(user, expiresAt, target, requestId);
+  }
+
+  private async issueForTarget(
+    user: UserRecord,
+    expiresAt: string,
+    target: VpnServerTarget,
+    requestId?: number
+  ): Promise<{ config: VpnConfigRecord; file: Buffer }> {
+    const { clientName, file } = await this.createUniqueClient(target);
     const now = new Date().toISOString();
     const record: VpnConfigRecord = {
       id: randomUUID(),
@@ -66,8 +96,12 @@ export class ConfigService {
     };
 
     try {
-      await this.db.insertConfig(record);
-      return record;
+      if (requestId === undefined) {
+        await this.db.insertConfig(record);
+      } else {
+        await this.db.insertConfigForRequest(record, requestId);
+      }
+      return { config: record, file };
     } catch (error) {
       await this.vpn
         .revokeClient(target, clientName)

@@ -31,6 +31,30 @@ describe("AppDatabase с Prisma", () => {
     expect(await db.listBroadcastRecipients("100")).toEqual(["200", "300"]);
   });
 
+  it("не создаёт повторную открытую заявку и разрешает новую после отказа", async () => {
+    const user = await db.upsertUser({
+      telegramId: "request-user",
+      firstName: "Анна",
+    });
+
+    const first = await db.createConfigRequest(user.id);
+    const duplicate = await db.createConfigRequest(user.id);
+
+    expect(first.created).toBe(true);
+    expect(duplicate).toEqual({ request: first.request, created: false });
+    expect(await db.countPendingConfigRequests()).toBe(1);
+    expect(await db.rejectConfigRequest(first.request.id)).toBe(true);
+
+    const next = await db.createConfigRequest(user.id);
+    expect(next.created).toBe(true);
+    expect(next.request.id).not.toBe(first.request.id);
+    expect(await db.claimConfigRequest(next.request.id)).toBe(true);
+    expect(await db.releaseProcessingConfigRequests()).toBe(1);
+    expect(await db.getConfigRequest(next.request.id)).toMatchObject({
+      status: "pending",
+    });
+  });
+
   it("скрывает конфиг после окончания десятидневного окна", async () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const now = new Date().toISOString();

@@ -149,7 +149,8 @@ export class TrafficService {
     await Promise.all(
       targets.map(async (target) => {
         try {
-          activeByServer.set(target.key, await this.vpn.activeSessions(target));
+          const snapshot = await this.snapshot(target);
+          activeByServer.set(target.key, snapshot.active);
           liveAvailable.set(target.key, true);
         } catch (error) {
           console.error(

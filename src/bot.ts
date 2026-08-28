@@ -7,6 +7,7 @@ import { broadcastText } from "./broadcast-service.js";
 import { ConfigService } from "./config-service.js";
 import { AppDatabase } from "./database.js";
 import type {
+  ConfigRequestRecord,
   LegacyClientRecord,
   ServerKey,
   UserRecord,
@@ -53,6 +54,14 @@ const MASS_EXTENSION_PERIODS = {
   "1y": { label: "1 год", duration: { years: 1 } },
 } as const;
 type MassExtensionCode = keyof typeof MASS_EXTENSION_PERIODS;
+const REQUEST_PERIODS = {
+  "30": { label: "30 дней", duration: { days: 30 } },
+  "60": { label: "60 дней", duration: { days: 60 } },
+  "90": { label: "90 дней", duration: { days: 90 } },
+  "6m": { label: "6 месяцев", duration: { months: 6 } },
+  "1y": { label: "1 год", duration: { years: 1 } },
+} as const;
+type RequestPeriodCode = keyof typeof REQUEST_PERIODS;
 
 export interface BotApplication {
   bot: Bot;
@@ -397,6 +406,51 @@ export function createBot(
     );
   });
 
+  bot.callbackQuery("cr", async (ctx) => {
+    if (isAdmin(ctx, appConfig))
+      return showAlert(ctx, "Администратор выдаёт конфиги из админ-панели.");
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+
+    const { request, created } = await db.createConfigRequest(user.id);
+    await ctx.answerCallbackQuery({
+      text: created ? "Заявка отправлена." : "Заявка уже ожидает рассмотрения.",
+    });
+    if (created) {
+      const configs = await db.listConfigsForUserAdmin(user.id);
+      await bot.api
+        .sendMessage(
+          appConfig.adminTelegramId,
+          [
+            "📥 Новая заявка на VPN-конфиг",
+            "",
+            `Пользователь: ${userLabel(user)}`,
+            `Конфигов сейчас: ${configs.length}`,
+            `Отправлена: ${formatRequestTime(request, appConfig.timezone)}`,
+          ].join("\n"),
+          {
+            reply_markup: new InlineKeyboard()
+              .text("✅ Рассмотреть", `rq|${request.id}`)
+              .row()
+              .text("❌ Отклонить", `rjr|${request.id}`)
+              .row()
+              .text("📥 Все заявки", "rql"),
+          }
+        )
+        .catch(logError);
+    }
+    await edit(
+      ctx,
+      created
+        ? "✅ Заявка отправлена администратору. Здесь появится сообщение и готовый файл после одобрения."
+        : "⏳ Ваша заявка уже ожидает решения администратора. Повторно отправлять её не нужно.",
+      new InlineKeyboard()
+        .url("💬 Связаться с администратором", appConfig.contactUrl)
+        .row()
+        .text("🏠 Главное меню", "m")
+    );
+  });
+
   bot.callbackQuery("ul", async (ctx) => {
     await ctx.answerCallbackQuery();
     const user = (await db.getUserByTelegramId(String(ctx.from.id)))!;
@@ -639,10 +693,239 @@ export function createBot(
     await showAdminMain(ctx, db);
   });
 
+  bot.callbackQuery("rql", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    await ctx.answerCallbackQuery();
+    await showPendingRequests(ctx, db, appConfig.timezone);
+  });
+
+  bot.callbackQuery(/^rq\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const request = await pendingRequest(db, Number(ctx.match[1]));
+    if (!request) return showAlert(ctx, "Заявка уже обработана.");
+    const user = await db.getUserById(request.userId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    await showRequestPeriodMenu(ctx, request, user, appConfig.timezone);
+  });
+
+  bot.callbackQuery(/^rqd\|(\d+)\|(30|60|90|6m|1y)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const request = await pendingRequest(db, Number(ctx.match[1]));
+    const period = ctx.match[2] as RequestPeriodCode;
+    if (!request) return showAlert(ctx, "Заявка уже обработана.");
+    const user = await db.getUserById(request.userId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    const servers = (await serverManager.listServers()).filter(
+      (server) => server.record.enabled && server.record.status === "ready"
+    );
+    if (servers.length === 0)
+      return showAlert(ctx, "Нет готовых серверов с включённой выдачей.");
+    const keyboard = new InlineKeyboard();
+    for (const server of servers) {
+      keyboard
+        .text(server.record.name, `rqs|${request.id}|${period}|${server.record.key}`)
+        .row();
+    }
+    keyboard.text("⬅️ Назад", `rq|${request.id}`);
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `📥 Заявка #${request.id}\nПользователь: ${userLabel(user)}\nСрок: ${REQUEST_PERIODS[period].label}\n\nВыберите сервер для нового конфига:`,
+      keyboard
+    );
+  });
+
+  bot.callbackQuery(
+    /^rqs\|(\d+)\|(30|60|90|6m|1y)\|([^|]+)$/,
+    async (ctx) => {
+      if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+      const request = await pendingRequest(db, Number(ctx.match[1]));
+      const period = ctx.match[2] as RequestPeriodCode;
+      if (!request) return showAlert(ctx, "Заявка уже обработана.");
+      const [user, server] = await Promise.all([
+        db.getUserById(request.userId),
+        serverManager.getServer(ctx.match[3]!),
+      ]);
+      if (!user) return showAlert(ctx, "Пользователь не найден.");
+      if (!server || !server.record.enabled || server.record.status !== "ready")
+        return showAlert(ctx, "Выбранный сервер сейчас недоступен.");
+      const expiresAt = requestExpiry(period, appConfig.timezone);
+      await ctx.answerCallbackQuery();
+      await edit(
+        ctx,
+        [
+          `📥 Подтвердите выдачу по заявке #${request.id}`,
+          "",
+          `Пользователь: ${userLabel(user)}`,
+          `Сервер: ${server.record.name}`,
+          `Срок: ${REQUEST_PERIODS[period].label}`,
+          `Действует до: ${formatDate(expiresAt, appConfig.timezone)}`,
+        ].join("\n"),
+        new InlineKeyboard()
+          .text(
+            "✅ Создать и отправить файл",
+            `rqc|${request.id}|${period}|${server.record.key}`
+          )
+          .row()
+          .text("⬅️ Сменить сервер", `rqd|${request.id}|${period}`)
+          .row()
+          .text("❌ Отклонить", `rjr|${request.id}`)
+      );
+    }
+  );
+
+  bot.callbackQuery(
+    /^rqc\|(\d+)\|(30|60|90|6m|1y)\|([^|]+)$/,
+    async (ctx) => {
+      if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+      const requestId = Number(ctx.match[1]);
+      const period = ctx.match[2] as RequestPeriodCode;
+      const serverKey = ctx.match[3]!;
+      const lockKey = `request:${requestId}`;
+      if (operationLocks.has(lockKey))
+        return showAlert(ctx, "Эта заявка уже обрабатывается.");
+      operationLocks.add(lockKey);
+      let claimed = false;
+      await ctx.answerCallbackQuery({ text: "Создаю конфиг…" });
+      try {
+        claimed = await db.claimConfigRequest(requestId);
+        if (!claimed) {
+          await edit(
+            ctx,
+            "Эта заявка уже обработана другим действием.",
+            new InlineKeyboard().text("📥 К заявкам", "rql")
+          );
+          return;
+        }
+        const request = await db.getConfigRequest(requestId);
+        const user = request ? await db.getUserById(request.userId) : null;
+        if (!request || !user) throw new Error("Пользователь заявки не найден");
+        const expiresAt = requestExpiry(period, appConfig.timezone);
+        const issued = await configService.issueForRequest(
+          user,
+          expiresAt,
+          serverKey,
+          requestId
+        );
+        const { config } = issued;
+        claimed = false;
+        const serverName = await serverManager.serverName(config.serverKey);
+        const delivered = await deliverRequestedConfig(
+          ctx,
+          user,
+          config,
+          issued.file,
+          appConfig,
+          serverName
+        );
+        await edit(
+          ctx,
+          [
+            `✅ Заявка #${requestId} одобрена`,
+            "",
+            `Пользователь: ${userLabel(user)}`,
+            `Конфиг: ${config.displayName}`,
+            `Сервер: ${serverName}`,
+            delivered
+              ? "Файл отправлен пользователю."
+              : "⚠️ Telegram не принял файл; конфиг доступен пользователю в разделе «Мои конфиги».",
+          ].join("\n"),
+          new InlineKeyboard()
+            .text("🔎 Открыть конфиг", `ac|${config.id}`)
+            .row()
+            .text("📥 К заявкам", "rql")
+            .text("🛠 Админ-панель", "a")
+        );
+      } catch (error) {
+        logError(error);
+        if (claimed) await db.releaseConfigRequest(requestId).catch(logError);
+        await respond(
+          ctx,
+          "❌ Не удалось выдать конфиг. Заявка сохранена и доступна для повторной обработки.",
+          new InlineKeyboard()
+            .text("🔄 Повторить", `rq|${requestId}`)
+            .row()
+            .text("📥 Все заявки", "rql")
+        );
+      } finally {
+        operationLocks.delete(lockKey);
+      }
+    }
+  );
+
+  bot.callbackQuery(/^rjr\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const request = await pendingRequest(db, Number(ctx.match[1]));
+    if (!request) return showAlert(ctx, "Заявка уже обработана.");
+    const user = await db.getUserById(request.userId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `Отклонить заявку #${request.id} от ${userLabel(user)}? Пользователь получит уведомление.`,
+      new InlineKeyboard()
+        .text("❌ Да, отклонить", `rjc|${request.id}`)
+        .row()
+        .text("⬅️ Назад", `rq|${request.id}`)
+    );
+  });
+
+  bot.callbackQuery(/^rjc\|(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const requestId = Number(ctx.match[1]);
+    const request = await db.getConfigRequest(requestId);
+    if (!request || request.status !== "pending")
+      return showAlert(ctx, "Заявка уже обработана.");
+    const user = await db.getUserById(request.userId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    if (!(await db.rejectConfigRequest(requestId)))
+      return showAlert(ctx, "Заявка уже обработана.");
+    await ctx.answerCallbackQuery({ text: "Заявка отклонена." });
+    await bot.api
+      .sendMessage(
+        user.telegramId,
+        "Заявка на новый VPN-конфиг отклонена. Если это произошло по ошибке, свяжитесь с администратором.",
+        {
+          reply_markup: new InlineKeyboard()
+            .url("💬 Связаться с администратором", appConfig.contactUrl)
+            .row()
+            .text("🏠 Главное меню", "m"),
+        }
+      )
+      .catch(logError);
+    await edit(
+      ctx,
+      `❌ Заявка #${requestId} от ${userLabel(user)} отклонена.`,
+      new InlineKeyboard()
+        .text("📥 К заявкам", "rql")
+        .row()
+        .text("🛠 Админ-панель", "a")
+    );
+  });
+
   bot.callbackQuery("at", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const lockKey = "traffic-stats";
+    if (operationLocks.has(lockKey))
+      return showAlert(ctx, "Статистика уже обновляется.");
+    operationLocks.add(lockKey);
     await ctx.answerCallbackQuery({ text: "Обновляю статистику…" });
-    await showTrafficStats(ctx, trafficService, serverManager);
+    try {
+      await showTrafficStats(ctx, trafficService, serverManager);
+    } catch (error) {
+      logError(error);
+      await respond(
+        ctx,
+        "❌ Не удалось обновить статистику. Попробуйте ещё раз; остальные функции бота продолжают работать.",
+        new InlineKeyboard()
+          .text("🔄 Повторить", "at")
+          .row()
+          .text("⬅️ Админ-панель", "a")
+      );
+    } finally {
+      operationLocks.delete(lockKey);
+    }
   });
 
   bot.callbackQuery("ax", async (ctx) => {
@@ -1262,9 +1545,9 @@ export function createBot(
 }
 
 function mainKeyboard(admin: boolean, contactUrl: string): InlineKeyboard {
-  const keyboard = new InlineKeyboard()
-    .text("🗂 Мои конфиги", "ul")
-    .row()
+  const keyboard = new InlineKeyboard().text("🗂 Мои конфиги", "ul").row();
+  if (!admin) keyboard.text("📨 Запросить новый конфиг", "cr").row();
+  keyboard
     .url("💳 Оплатить или продлить", contactUrl)
     .row()
     .text("📖 Как установить", "help");
@@ -1349,7 +1632,10 @@ async function showAdminMain(
   ctx: Context,
   db: AppDatabase
 ): Promise<void> {
-  const stats = await db.stats();
+  const [stats, pendingRequests] = await Promise.all([
+    db.stats(),
+    db.countPendingConfigRequests(),
+  ]);
 
   const text = [
     "🛠 Админ-панель",
@@ -1362,6 +1648,8 @@ async function showAdminMain(
     ctx,
     text,
     new InlineKeyboard()
+      .text(`📥 Заявки (${pendingRequests})`, "rql")
+      .row()
       .text("🔎 Найти пользователя", "as")
       .row()
       .text("🖥 Серверы", "sv")
@@ -1373,6 +1661,68 @@ async function showAdminMain(
       .text("📊 Статистика", "at")
       .row()
       .text("🏠 Главное меню", "m")
+  );
+}
+
+async function showPendingRequests(
+  ctx: Context,
+  db: AppDatabase,
+  timezone: string
+): Promise<void> {
+  const requests = await db.listPendingConfigRequests();
+  const keyboard = new InlineKeyboard();
+  for (const { request, user } of requests) {
+    keyboard
+      .text(
+        `#${request.id} · ${compactUserLabel(user)}`,
+        `rq|${request.id}`
+      )
+      .row();
+  }
+  keyboard.text("🔄 Обновить", "rql").row().text("⬅️ Админ-панель", "a");
+  await edit(
+    ctx,
+    requests.length
+      ? [
+          "📥 Заявки на новые конфиги",
+          "",
+          `Ожидают решения: ${requests.length}`,
+          `Самая ранняя: ${formatRequestTime(requests[0]!.request, timezone)}`,
+          "",
+          "Выберите заявку:",
+        ].join("\n")
+      : "📭 Новых заявок сейчас нет.",
+    keyboard
+  );
+}
+
+async function showRequestPeriodMenu(
+  ctx: Context,
+  request: ConfigRequestRecord,
+  user: UserRecord,
+  timezone: string
+): Promise<void> {
+  await edit(
+    ctx,
+    [
+      `📥 Заявка #${request.id}`,
+      `Пользователь: ${userLabel(user)}`,
+      `Отправлена: ${formatRequestTime(request, timezone)}`,
+      "",
+      "Выберите срок действия нового конфига:",
+    ].join("\n"),
+    new InlineKeyboard()
+      .text("30 дней", `rqd|${request.id}|30`)
+      .text("60 дней", `rqd|${request.id}|60`)
+      .row()
+      .text("90 дней", `rqd|${request.id}|90`)
+      .text("6 месяцев", `rqd|${request.id}|6m`)
+      .row()
+      .text("1 год", `rqd|${request.id}|1y`)
+      .row()
+      .text("❌ Отклонить", `rjr|${request.id}`)
+      .row()
+      .text("⬅️ К заявкам", "rql")
   );
 }
 
@@ -1395,6 +1745,12 @@ async function showTrafficStats(
     lines.push(
       "",
       ...trafficServerLines(names.get(serverKey) ?? serverKey, traffic)
+    );
+  }
+  if (Object.values(stats.servers).some((traffic) => !traffic.liveAvailable)) {
+    lines.push(
+      "",
+      "⚠️ Для недоступных по SSH серверов показана сохранённая история без текущих подключений."
     );
   }
   await edit(
@@ -1860,6 +2216,75 @@ function addPaginationRow(
   keyboard.text(`${page + 1}/${totalPages}`, callback(page));
   if (page < totalPages - 1) keyboard.text("➡️", callback(page + 1));
   keyboard.row();
+}
+
+async function pendingRequest(
+  db: AppDatabase,
+  requestId: number
+): Promise<ConfigRequestRecord | null> {
+  const request = await db.getConfigRequest(requestId);
+  return request?.status === "pending" ? request : null;
+}
+
+function requestExpiry(code: RequestPeriodCode, timezone: string): string {
+  const date = code === "6m"
+    ? dateAfterMonths(6, timezone)
+    : code === "1y"
+      ? dateAfterYears(1, timezone)
+      : dateAfterDays(Number(code), timezone);
+  return expiryFromDate(date, timezone)!;
+}
+
+function formatRequestTime(
+  request: ConfigRequestRecord,
+  timezone: string
+): string {
+  return DateTime.fromISO(request.requestedAt)
+    .setZone(timezone)
+    .toFormat("dd.MM.yyyy HH:mm");
+}
+
+function compactUserLabel(user: UserRecord): string {
+  return user.username ? `@${user.username}` : user.firstName.slice(0, 32);
+}
+
+async function deliverRequestedConfig(
+  ctx: Context,
+  user: UserRecord,
+  config: VpnConfigRecord,
+  file: Buffer,
+  appConfig: AppConfig,
+  serverName: string
+): Promise<boolean> {
+  try {
+    await ctx.api.sendDocument(
+      user.telegramId,
+      new InputFile(file, vpnFileName(config.clientName)),
+      {
+        caption: `✅ Заявка одобрена. Конфиг «${config.displayName}» готов. Сервер: ${serverName}. Действует до ${formatDate(config.expiresAt, appConfig.timezone)}.`,
+        reply_markup: new InlineKeyboard()
+          .text("🔎 Открыть конфиг", `uc|${config.id}`)
+          .row()
+          .text("📖 Как установить", "help"),
+      }
+    );
+    return true;
+  } catch (error) {
+    logError(error);
+    await ctx.api
+      .sendMessage(
+        user.telegramId,
+        `✅ Заявка одобрена. Конфиг «${config.displayName}» готов и доступен в разделе «Мои конфиги».`,
+        {
+          reply_markup: new InlineKeyboard()
+            .text("🔎 Открыть конфиг", `uc|${config.id}`)
+            .row()
+            .text("🏠 Главное меню", "m"),
+        }
+      )
+      .catch(logError);
+    return false;
+  }
 }
 
 function userLabel(user: UserRecord): string {

@@ -1,6 +1,11 @@
 export type ServerKey = string;
 export type ConfigStatus = "active" | "expired" | "revoked" | "error";
 export type ServerStatus = "ready" | "pending" | "error";
+export type ConfigRequestStatus =
+  | "pending"
+  | "processing"
+  | "approved"
+  | "rejected";
 
 export interface UserRecord {
   id: number;
@@ -24,6 +29,15 @@ export interface VpnConfigRecord {
   hiddenAt: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ConfigRequestRecord {
+  id: number;
+  userId: number;
+  status: ConfigRequestStatus;
+  configId: string | null;
+  requestedAt: string;
+  resolvedAt: string | null;
 }
 
 export interface LegacyClientRecord {

@@ -143,6 +143,31 @@ describe("ConfigService", () => {
     expect(config.serverKey).toBe("old");
   });
 
+  it("выдаёт конфиг по заявке на выбранном сервере и атомарно одобряет её", async () => {
+    const user = await db.upsertUser({
+      telegramId: "request-issue",
+      firstName: "Заявитель",
+    });
+    const { request } = await db.createConfigRequest(user.id);
+    expect(await db.claimConfigRequest(request.id)).toBe(true);
+
+    const issued = await service.issueForRequest(
+      user,
+      "2027-01-01T20:59:59.999Z",
+      "old",
+      request.id
+    );
+    const { config } = issued;
+
+    expect(config.serverKey).toBe("old");
+    expect(issued.file).toBeInstanceOf(Buffer);
+    expect(await db.getConfigRequest(request.id)).toMatchObject({
+      status: "approved",
+      configId: config.id,
+    });
+    expect(await db.getConfig(config.id)).not.toBeNull();
+  });
+
   it("выдаёт разные технические имена и не меняет их при переименовании", async () => {
     const user = await db.upsertUser({ telegramId: "101", firstName: "Анна" });
     const first = await service.issue(user, "2027-01-01T20:59:59.999Z");
