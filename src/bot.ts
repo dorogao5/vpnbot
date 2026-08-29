@@ -1,6 +1,7 @@
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
 import type { MessageEntity } from "grammy/types";
 import { DateTime } from "luxon";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import type { AppConfig } from "./config.js";
 import { broadcastText } from "./broadcast-service.js";
 import { ConfigService } from "./config-service.js";
@@ -13,7 +14,7 @@ import type {
 } from "./domain.js";
 import type { VpnServerTarget } from "./openvpn.js";
 import { ServerManager, type ServerWithTarget } from "./server-manager.js";
-import { vpnFileName } from "./file-name.js";
+import { labeledVpnFileName, vpnFileName } from "./file-name.js";
 import {
   TrafficService,
   type ConfigConnectionState,
@@ -44,6 +45,14 @@ type PendingInput =
 const pendingInputs = new Map<string, PendingInput>();
 const operationLocks = new Set<string>();
 const CONFIG_PAGE_SIZE = 10;
+const MASS_EXTENSION_PERIODS = {
+  "7d": { label: "7 дней", duration: { days: 7 } },
+  "1m": { label: "1 месяц", duration: { months: 1 } },
+  "3m": { label: "3 месяца", duration: { months: 3 } },
+  "6m": { label: "6 месяцев", duration: { months: 6 } },
+  "1y": { label: "1 год", duration: { years: 1 } },
+} as const;
+type MassExtensionCode = keyof typeof MASS_EXTENSION_PERIODS;
 
 export interface BotApplication {
   bot: Bot;
@@ -56,12 +65,25 @@ export function createBot(
   trafficService: TrafficService,
   serverManager: ServerManager
 ): BotApplication {
-  const bot = new Bot(appConfig.botToken);
+  const bot = new Bot(
+    appConfig.botToken,
+    appConfig.telegramProxyUrl
+      ? {
+          client: {
+            baseFetchConfig: {
+              agent: new SocksProxyAgent(appConfig.telegramProxyUrl),
+              compress: true,
+            },
+          },
+        }
+      : undefined
+  );
   const broadcastDrafts = new Map<
     string,
     { text: string; entities?: MessageEntity[] }
   >();
   let broadcastRunning = false;
+  const allFilesLocks = new Set<string>();
 
   serverManager.onBootstrapFinished = (text) => notifyAdmin(bot, appConfig, text);
 
@@ -153,7 +175,9 @@ export function createBot(
       await ctx.reply(message, {
         ...(ctx.message.entities ? { entities: ctx.message.entities } : {}),
         reply_markup: new InlineKeyboard()
-          .text("✅ Подтвердить рассылку", "bcc")
+          .text("✅ Отправить сообщение", "bcc")
+          .row()
+          .text("📦 Отправить с кнопкой файлов", "bccf")
           .row()
           .text("❌ Отменить", "bca"),
       });
@@ -409,6 +433,62 @@ export function createBot(
     );
   });
 
+  bot.callbackQuery("dla", async (ctx) => {
+    const telegramId = String(ctx.from.id);
+    if (allFilesLocks.has(telegramId)) {
+      return showAlert(ctx, "Файлы уже подготавливаются.");
+    }
+    const user = await db.getUserByTelegramId(telegramId);
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    const configs = (await db.listVisibleConfigs(user.id)).filter(
+      (config) => config.status === "active" && !isExpired(config.expiresAt)
+    );
+    if (configs.length === 0) {
+      return showAlert(ctx, "У Вас нет действующих конфигов.");
+    }
+
+    allFilesLocks.add(telegramId);
+    await ctx.answerCallbackQuery({ text: "Подготавливаю файлы…" });
+    await ctx.reply(
+      `⏳ Подготавливаю Ваши действующие конфиги: ${configs.length}. Файлы придут отдельными сообщениями.`
+    );
+    let delivered = 0;
+    let failed = 0;
+    try {
+      for (const config of configs) {
+        try {
+          const file = await configService.download(config);
+          await ctx.replyWithDocument(
+            new InputFile(
+              file,
+              labeledVpnFileName(config.displayName, config.clientName)
+            ),
+            {
+              caption: `🔐 ${config.displayName}\n📅 Действует до ${formatDate(config.expiresAt, appConfig.timezone)}`,
+            }
+          );
+          delivered += 1;
+        } catch (error) {
+          failed += 1;
+          logError(error);
+        }
+      }
+      await ctx.reply(
+        failed === 0
+          ? `✅ Все файлы отправлены: ${delivered}. Удалите старые профили из OpenVPN Connect и импортируйте полученные заново.`
+          : `⚠️ Отправлено файлов: ${delivered}. Не удалось подготовить: ${failed}. Если нужного файла нет, обратитесь к администратору.`,
+        {
+          reply_markup: mainKeyboard(
+            isAdmin(ctx, appConfig),
+            appConfig.contactUrl
+          ),
+        }
+      );
+    } finally {
+      allFilesLocks.delete(telegramId);
+    }
+  });
+
   bot.callbackQuery(/^dl\|(.+)$/, async (ctx) => {
     const config = await ownedConfig(ctx, db, ctx.match[1]!);
     if (!config) return showAlert(ctx, "Конфиг не найден.");
@@ -565,6 +645,71 @@ export function createBot(
     await showTrafficStats(ctx, trafficService, serverManager);
   });
 
+  bot.callbackQuery("ax", async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const count = await db.countExtendableConfigs();
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `⏳ Массовое продление\n\nБудут продлены ${count} действующих конфигов. Просроченные и отозванные конфиги не изменятся.\n\nСрок прибавляется к текущей дате окончания каждого конфига.`,
+      new InlineKeyboard()
+        .text("+7 дней", "axp|7d")
+        .text("+1 месяц", "axp|1m")
+        .row()
+        .text("+3 месяца", "axp|3m")
+        .text("+6 месяцев", "axp|6m")
+        .row()
+        .text("+1 год", "axp|1y")
+        .row()
+        .text("❌ Отмена", "a")
+    );
+  });
+
+  bot.callbackQuery(/^axp\|(7d|1m|3m|6m|1y)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const code = ctx.match[1] as MassExtensionCode;
+    const period = MASS_EXTENSION_PERIODS[code];
+    const count = await db.countExtendableConfigs();
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      `Подтвердите массовое продление.\n\nКонфигов: ${count}\nДобавить каждому: ${period.label}\n\nОтменить это действие автоматически будет нельзя.`,
+      new InlineKeyboard()
+        .text(`✅ Добавить ${period.label}`, `axc|${code}`)
+        .row()
+        .text("❌ Отмена", "ax")
+    );
+  });
+
+  bot.callbackQuery(/^axc\|(7d|1m|3m|6m|1y)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const lockKey = "mass-extension";
+    if (operationLocks.has(lockKey))
+      return showAlert(ctx, "Массовое продление уже выполняется.");
+    const code = ctx.match[1] as MassExtensionCode;
+    const period = MASS_EXTENSION_PERIODS[code];
+    operationLocks.add(lockKey);
+    await ctx.answerCallbackQuery({ text: "Продлеваю конфиги…" });
+    try {
+      const count = await db.extendAllActiveConfigs(period.duration);
+      await edit(
+        ctx,
+        `✅ Массовое продление завершено.\n\nПродлено конфигов: ${count}\nДобавлено каждому: ${period.label}.`,
+        new InlineKeyboard().text("🛠 Админ-панель", "a")
+      );
+    } catch (error) {
+      logError(error);
+      await ctx.reply("Не удалось выполнить массовое продление.", {
+        reply_markup: new InlineKeyboard()
+          .text("Попробовать снова", "ax")
+          .row()
+          .text("🛠 Админ-панель", "a"),
+      });
+    } finally {
+      operationLocks.delete(lockKey);
+    }
+  });
+
   bot.callbackQuery("sv", async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     pendingInputs.delete(String(ctx.from.id));
@@ -606,6 +751,63 @@ export function createBot(
       `✏️ Отправьте новое название для сервера «${server.record.name}». Не более 40 символов. Его увидят пользователи в своих конфигах.`,
       new InlineKeyboard().text("❌ Отмена", `svo|${server.record.key}`)
     );
+  });
+
+  bot.callbackQuery(/^svd\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const server = await serverManager.getServer(ctx.match[1]!);
+    if (!server) return showAlert(ctx, "Сервер не найден.");
+    const impact = await db.serverDeletionImpact(server.record.key);
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      [
+        `🗑 Удалить сервер «${server.record.name}» из бота?`,
+        "",
+        `Связанных конфигов в базе: ${impact.configs}`,
+        `Импортированных клиентов: ${impact.legacyClients}`,
+        `Ожидающих отзывов: ${impact.pendingRevocations}`,
+        "",
+        "Сами пользовательские конфиги и история трафика сохранятся, но операции с ними через этот сервер станут недоступны. На VPS ничего удаляться не будет.",
+      ].join("\n"),
+      new InlineKeyboard()
+        .text("🗑 Да, удалить из бота", `svdc|${server.record.key}`)
+        .row()
+        .text("❌ Отмена", `svo|${server.record.key}`)
+    );
+  });
+
+  bot.callbackQuery(/^svdc\|(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
+    const server = await serverManager.getServer(ctx.match[1]!);
+    if (!server) return showAlert(ctx, "Сервер уже удалён.");
+    const lockKey = `server-delete:${server.record.key}`;
+    if (operationLocks.has(lockKey))
+      return showAlert(ctx, "Удаление уже выполняется.");
+    operationLocks.add(lockKey);
+    await ctx.answerCallbackQuery({ text: "Удаляю сервер…" });
+    try {
+      const impact = await serverManager.deleteServer(server.record.key);
+      await edit(
+        ctx,
+        `✅ Сервер «${server.record.name}» удалён из бота.\n\nСохранено пользовательских конфигов: ${impact.configs}.`,
+        new InlineKeyboard()
+          .text("🖥 К серверам", "sv")
+          .row()
+          .text("🛠 Админ-панель", "a")
+      );
+    } catch (error) {
+      logError(error);
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.reply(`Не удалось удалить сервер: ${message}`, {
+        reply_markup: new InlineKeyboard().text(
+          "Назад",
+          `svo|${server.record.key}`
+        ),
+      });
+    } finally {
+      operationLocks.delete(lockKey);
+    }
   });
 
   bot.callbackQuery("svadd", async (ctx) => {
@@ -654,13 +856,14 @@ export function createBot(
     await showAdminMain(ctx, db);
   });
 
-  bot.callbackQuery("bcc", async (ctx) => {
+  bot.callbackQuery(/^bcc(f)?$/, async (ctx) => {
     if (!isAdmin(ctx, appConfig)) return showAlert(ctx, "Недостаточно прав.");
     if (broadcastRunning)
       return showAlert(ctx, "Предыдущая рассылка ещё выполняется.");
     const telegramId = String(ctx.from.id);
     const draft = broadcastDrafts.get(telegramId);
     if (!draft) return showAlert(ctx, "Черновик рассылки не найден.");
+    const includeFilesButton = ctx.match[1] === "f";
 
     broadcastRunning = true;
     broadcastDrafts.delete(telegramId);
@@ -681,6 +884,14 @@ export function createBot(
           async (recipientId, text) => {
             await bot.api.sendMessage(recipientId, text, {
               ...(draft.entities ? { entities: draft.entities } : {}),
+              ...(includeFilesButton
+                ? {
+                    reply_markup: new InlineKeyboard().text(
+                      "📦 Получить все новые файлы",
+                      "dla"
+                    ),
+                  }
+                : {}),
             });
           }
         );
@@ -840,7 +1051,7 @@ export function createBot(
 
       await edit(
         ctx,
-        `✅ Конфиг «${moved.config.displayName}» перенесён на сервер «${targetName}». Старый файл отозван.`,
+        `✅ Конфиг «${moved.config.displayName}» перенесён на сервер «${targetName}». Старый файл больше не используется.`,
         new InlineKeyboard()
           .text("📥 Получить новый файл", `adl|${moved.config.id}`)
           .row()
@@ -1157,6 +1368,8 @@ async function showAdminMain(
       .row()
       .text("📣 Рассылка", "bc")
       .row()
+      .text("⏳ Продлить все конфиги", "ax")
+      .row()
       .text("📊 Статистика", "at")
       .row()
       .text("🏠 Главное меню", "m")
@@ -1239,6 +1452,7 @@ async function showServerCard(
   const lines: string[] = [
     `🖥 Сервер: ${record.name}`,
     `🌐 Адрес: ${record.host}:${record.port}`,
+    ...(record.relayPort ? [`🔀 VPN relay: ${record.relayPort}/TCP`] : []),
     record.status === "ready"
       ? "🟢 Статус: работает"
       : record.status === "pending"
@@ -1283,6 +1497,8 @@ async function showServerCard(
       .row();
   }
   keyboard
+    .text("🗑 Удалить сервер", `svd|${record.key}`)
+    .row()
     .text("🔄 Обновить", `svo|${record.key}`)
     .row()
     .text("⬅️ К серверам", "sv")

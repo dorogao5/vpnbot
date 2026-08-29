@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly interface="wg-vpnbot"
+readonly peer="10.210.0.2"
+readonly mark="0x210"
+readonly table="210"
+readonly preference="10210"
+
+rule_exists() {
+  ip -4 rule show | grep -Eq "^${preference}:.*fwmark ${mark}.*lookup ${table}$"
+}
+
+if ip link show "$interface" >/dev/null 2>&1 \
+  && ping -q -c 1 -W 2 -I "$interface" "$peer" >/dev/null 2>&1; then
+  ip -4 route replace table "$table" default dev "$interface"
+  rule_exists || ip -4 rule add preference "$preference" fwmark "$mark" lookup "$table"
+else
+  while rule_exists; do
+    ip -4 rule del preference "$preference"
+  done
+  ip -4 route flush table "$table" 2>/dev/null || true
+fi

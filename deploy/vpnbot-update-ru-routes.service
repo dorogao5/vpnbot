@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Russian IPv4 prefixes for VPN policy routing
+After=network-online.target vpnbot-moscow-routing.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-update-ru-routes

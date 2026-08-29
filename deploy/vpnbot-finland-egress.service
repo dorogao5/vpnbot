@@ -1,0 +1,13 @@
+[Unit]
+Description=Finland egress for non-Russian VPN traffic
+After=network-online.target wg-quick@wg-vpnbot.service
+Wants=network-online.target wg-quick@wg-vpnbot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpnbot-finland-egress up
+ExecStop=/usr/local/sbin/vpnbot-finland-egress down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

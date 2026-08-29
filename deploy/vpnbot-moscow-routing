@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly nft_config="/etc/vpnbot-geo-routing.nft"
+readonly comment="vpnbot-geo-routing"
+
+add_rule() {
+  local table="$1"
+  shift
+  if ! iptables -w 5 -t "$table" -C "$@" >/dev/null 2>&1; then
+    iptables -w 5 -t "$table" -I "$@"
+  fi
+}
+
+delete_rule() {
+  local table="$1"
+  shift
+  while iptables -w 5 -t "$table" -C "$@" >/dev/null 2>&1; do
+    iptables -w 5 -t "$table" -D "$@"
+  done
+}
+
+case "${1:-}" in
+  up)
+    nft delete table inet vpnbot_geo 2>/dev/null || true
+    nft --file "$nft_config"
+    /usr/local/sbin/vpnbot-update-ru-routes
+    add_rule filter DOCKER-USER -i tun1 -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    add_rule filter DOCKER-USER -o tun1 -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    /usr/local/sbin/vpnbot-route-health
+    ;;
+  down)
+    while ip -4 rule show | grep -q '^10210:'; do
+      ip -4 rule del preference 10210
+    done
+    ip -4 route flush table 210 2>/dev/null || true
+    nft delete table inet vpnbot_geo 2>/dev/null || true
+    delete_rule filter DOCKER-USER -i tun1 -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    delete_rule filter DOCKER-USER -o tun1 -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    ;;
+  *)
+    echo "Использование: $0 up|down" >&2
+    exit 2
+    ;;
+esac

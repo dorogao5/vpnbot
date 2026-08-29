@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly comment="vpnbot-finland-egress"
+
+add_rule() {
+  local table="$1"
+  shift
+  if ! iptables -w 5 -t "$table" -C "$@" >/dev/null 2>&1; then
+    iptables -w 5 -t "$table" -I "$@"
+  fi
+}
+
+delete_rule() {
+  local table="$1"
+  shift
+  while iptables -w 5 -t "$table" -C "$@" >/dev/null 2>&1; do
+    iptables -w 5 -t "$table" -D "$@"
+  done
+}
+
+case "${1:-}" in
+  up)
+    ip -4 route replace 10.9.0.0/24 dev wg-vpnbot
+    add_rule filter FORWARD -i wg-vpnbot -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    add_rule filter FORWARD -o wg-vpnbot -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    add_rule nat POSTROUTING -s 10.9.0.0/24 -o ens3 -m comment --comment "$comment" -j MASQUERADE
+    ;;
+  down)
+    ip -4 route del 10.9.0.0/24 dev wg-vpnbot 2>/dev/null || true
+    delete_rule filter FORWARD -i wg-vpnbot -s 10.9.0.0/24 -m comment --comment "$comment" -j ACCEPT
+    delete_rule filter FORWARD -o wg-vpnbot -d 10.9.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT
+    delete_rule nat POSTROUTING -s 10.9.0.0/24 -o ens3 -m comment --comment "$comment" -j MASQUERADE
+    ;;
+  *)
+    echo "Использование: $0 up|down" >&2
+    exit 2
+    ;;
+esac

@@ -43,6 +43,8 @@ export interface VpnServerRecord {
   sshUser: string;
   sshPrivateKey: string;
   hostFingerprint: string;
+  relayPort: number | null;
+  relayManaged: boolean;
   status: ServerStatus;
   enabled: boolean;
   isBuiltin: boolean;
