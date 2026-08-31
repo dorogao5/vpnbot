@@ -335,22 +335,24 @@ export function createBot(
     const user = await db.getUserByTelegramId(String(ctx.from.id));
     if (!user) return showAlert(ctx, "Пользователь не найден.");
     const code = await createVkAccountLinkCode(db, user.id);
+    const text = [
+      "🔗 Связать VK",
+      "",
+      "Откройте диалог с нашим сообществом VK и отправьте этот одноразовый код отдельным сообщением:",
+      "",
+      code,
+      "",
+      "Код действует 10 минут и сработает только один раз.",
+    ].join("\n");
     await ctx.answerCallbackQuery();
     await edit(
       ctx,
-      [
-        "🔗 Связать VK",
-        "",
-        "Откройте диалог с нашим сообществом VK и отправьте этот одноразовый код отдельным сообщением:",
-        "",
-        code,
-        "",
-        "Код действует 10 минут и сработает только один раз.",
-      ].join("\n"),
+      text,
       new InlineKeyboard()
         .url("Открыть VK", `https://vk.com/write-${appConfig.vk.groupId}`)
         .row()
-        .text("⬅️ Главное меню", "m")
+        .text("⬅️ Главное меню", "m"),
+      [{ type: "code", offset: text.indexOf(code), length: code.length }]
     );
   });
 
@@ -1982,14 +1984,21 @@ function trafficServerLines(
 async function edit(
   ctx: Context,
   text: string,
-  keyboard: InlineKeyboard
+  keyboard: InlineKeyboard,
+  entities?: MessageEntity[]
 ): Promise<void> {
   try {
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await ctx.editMessageText(text, {
+      reply_markup: keyboard,
+      ...(entities ? { entities } : {}),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.includes("message is not modified"))
-      await ctx.reply(text, { reply_markup: keyboard });
+      await ctx.reply(text, {
+        reply_markup: keyboard,
+        ...(entities ? { entities } : {}),
+      });
   }
 }
 

@@ -1,7 +1,7 @@
 import { consumeVkAccountLinkCode, isVkAccountLinkCode } from "./account-link.js";
 import type { AppDatabase } from "./database.js";
 import type { ConfigService } from "./config-service.js";
-import type { VpnConfigRecord } from "./domain.js";
+import type { UserRecord, VpnConfigRecord } from "./domain.js";
 import { labeledVpnFileName, vpnFileName } from "./file-name.js";
 import type { ServerManager } from "./server-manager.js";
 import { formatDate, isExpired } from "./time.js";
@@ -14,6 +14,11 @@ import {
 } from "./vk-api.js";
 
 const CONFIG_PAGE_SIZE = 5;
+const LINK_REQUIRED_MESSAGE = [
+  "🔗 Сначала свяжите VK с Telegram.",
+  "",
+  "Откройте Telegram-бота, нажмите «Связать VK», получите одноразовый код и отправьте его сюда отдельным сообщением.",
+].join("\n");
 
 interface VkMessage {
   from_id: number;
@@ -148,7 +153,7 @@ export class VkBot {
         await this.api.sendMessage({
           peerId: message.peer_id,
           message: "Код привязки неверен, уже использован или истёк. Получите новый код в Telegram.",
-          keyboard: mainKeyboard(),
+          ...(vkRequiresTelegramLink(user) ? {} : { keyboard: mainKeyboard() }),
         });
         return;
       }
@@ -158,6 +163,12 @@ export class VkBot {
         message: "✅ VK успешно связан с Вашим аккаунтом Telegram. Конфиги и сроки теперь общие.",
         keyboard: mainKeyboard(),
       });
+      return;
+    }
+
+    if (vkRequiresTelegramLink(user)) {
+      this.pendingRename.delete(String(message.from_id));
+      await this.showLinkRequired(message.peer_id);
       return;
     }
 
@@ -202,9 +213,9 @@ export class VkBot {
     peerId: number,
     action: VkAction | null
   ): Promise<void> {
-    if (!action) return this.showMain(peerId);
     const user = await this.db.getUserByVkId(String(vkId));
-    if (!user) return this.showMain(peerId);
+    if (!user || vkRequiresTelegramLink(user)) return this.showLinkRequired(peerId);
+    if (!action) return this.showMain(peerId);
 
     if (action.a === "main") return this.showMain(peerId);
     if (action.a === "help") return this.showHelp(peerId);
@@ -245,6 +256,13 @@ export class VkBot {
       peerId,
       message: "👋 VPN-бот\n\nЗдесь можно получить конфиги, проверить срок действия и перевыпустить файл.",
       keyboard: mainKeyboard(),
+    });
+  }
+
+  private async showLinkRequired(peerId: number): Promise<void> {
+    await this.api.sendMessage({
+      peerId,
+      message: LINK_REQUIRED_MESSAGE,
     });
   }
 
@@ -486,6 +504,12 @@ export class VkBot {
     this.profiles.set(userId, profile);
     return profile;
   }
+}
+
+export function vkRequiresTelegramLink(
+  user: Pick<UserRecord, "telegramId"> | null
+): boolean {
+  return !user?.telegramId;
 }
 
 function mainKeyboard(): string {
