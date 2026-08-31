@@ -66,7 +66,7 @@ export class BackgroundJobs {
       const remindersByUser = new Map<
         string,
         {
-          user: UserRecord;
+          telegramId: string;
           items: Array<{
             config: VpnConfigRecord;
             days: number;
@@ -76,6 +76,7 @@ export class BackgroundJobs {
       >();
 
       for (const { config, user } of await this.db.listReminderCandidates()) {
+        if (!user.telegramId) continue;
         const days = daysUntilExpiry(
           config.expiresAt,
           this.config.timezone,
@@ -86,14 +87,14 @@ export class BackgroundJobs {
         if (await this.db.notificationWasSent(config.id, kind, localDate)) continue;
 
         const batch = remindersByUser.get(user.telegramId) ?? {
-          user,
+          telegramId: user.telegramId,
           items: [],
         };
         batch.items.push({ config, days, kind });
         remindersByUser.set(user.telegramId, batch);
       }
 
-      for (const { user, items } of remindersByUser.values()) {
+      for (const { telegramId, items } of remindersByUser.values()) {
         items.sort((left, right) =>
           left.config.expiresAt.localeCompare(right.config.expiresAt)
         );
@@ -107,7 +108,7 @@ export class BackgroundJobs {
 
         try {
           await this.bot.api.sendMessage(
-            user.telegramId,
+            telegramId,
             `${heading}\n\n${lines.join("\n")}\n\n💳 Для продления оплатите подписку и после оплаты сообщите администратору.`,
             {
               reply_markup: {
@@ -128,7 +129,7 @@ export class BackgroundJobs {
           );
         } catch (error) {
           console.error(
-            `Не удалось отправить напоминание пользователю ${user.telegramId}`,
+            `Не удалось отправить напоминание пользователю ${telegramId}`,
             error
           );
         }

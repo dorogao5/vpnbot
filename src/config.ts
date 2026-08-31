@@ -16,6 +16,8 @@ const schema = z.object({
   DATABASE_URL: z.string().url().startsWith("postgresql://"),
   TIMEZONE: z.string().default("Europe/Moscow"),
   REMINDER_HOUR: z.coerce.number().int().min(0).max(23).default(10),
+  VK_GROUP_ID: optionalString,
+  VK_GROUP_TOKEN: optionalString,
   VPN_HELPER_COMMAND: z
     .string()
     .default("sudo /usr/local/sbin/openvpn-bot-helper"),
@@ -73,6 +75,10 @@ export interface AppConfig {
   databaseUrl: string;
   timezone: string;
   reminderHour: number;
+  vk: {
+    groupId: number;
+    token: string;
+  } | undefined;
   helperCommand: string;
   bootstrapPublicKey: string | undefined;
   telegramProxyUrl: string | undefined;
@@ -124,6 +130,18 @@ function serverFromEnv(
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = schema.parse(env);
+  if (Boolean(parsed.VK_GROUP_ID) !== Boolean(parsed.VK_GROUP_TOKEN)) {
+    throw new Error("VK_GROUP_ID и VK_GROUP_TOKEN необходимо задавать вместе");
+  }
+  const vkGroupId = parsed.VK_GROUP_ID
+    ? Number(parsed.VK_GROUP_ID)
+    : undefined;
+  if (
+    vkGroupId !== undefined &&
+    (!Number.isSafeInteger(vkGroupId) || vkGroupId <= 0)
+  ) {
+    throw new Error("VK_GROUP_ID должен быть положительным числовым ID сообщества");
+  }
   if (parsed.VPN_RELAY_HOST && !parsed.VPN_RELAY_PORT) {
     throw new Error("Для VPN_RELAY_HOST необходимо задать VPN_RELAY_PORT");
   }
@@ -179,6 +197,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     databaseUrl: parsed.DATABASE_URL,
     timezone: parsed.TIMEZONE,
     reminderHour: parsed.REMINDER_HOUR,
+    vk: vkGroupId && parsed.VK_GROUP_TOKEN
+      ? { groupId: vkGroupId, token: parsed.VK_GROUP_TOKEN }
+      : undefined,
     helperCommand: parsed.VPN_HELPER_COMMAND,
     bootstrapPublicKey: parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH
       ? readFileSync(parsed.VPN_BOOTSTRAP_PUBLIC_KEY_PATH, "utf8").trim()

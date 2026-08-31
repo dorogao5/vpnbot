@@ -4,6 +4,7 @@ import type {
   User,
   VpnConfig,
   LegacyClient,
+  MessengerProvider,
   VpnServer,
 } from "./generated/prisma/client.js";
 import { PrismaClient } from "./generated/prisma/client.js";
@@ -107,19 +108,104 @@ export class AppDatabase {
   }
 
   async upsertUser(input: { telegramId: string; username?: string; firstName: string }): Promise<UserRecord> {
-    const row = await this.prisma.user.upsert({
-      where: { telegramId: input.telegramId },
-      create: {
-        telegramId: input.telegramId,
-        username: input.username ?? null,
-        firstName: input.firstName,
-      },
-      update: {
-        username: input.username ?? null,
-        firstName: input.firstName,
-      },
+    const row = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.upsert({
+        where: { telegramId: input.telegramId },
+        create: {
+          telegramId: input.telegramId,
+          username: input.username ?? null,
+          firstName: input.firstName,
+        },
+        update: {
+          username: input.username ?? null,
+          firstName: input.firstName,
+        },
+      });
+      await tx.messengerIdentity.upsert({
+        where: {
+          provider_externalId: {
+            provider: "telegram",
+            externalId: input.telegramId,
+          },
+        },
+        create: {
+          userId: user.id,
+          provider: "telegram",
+          externalId: input.telegramId,
+          peerId: input.telegramId,
+          username: input.username ?? null,
+        },
+        update: {
+          userId: user.id,
+          peerId: input.telegramId,
+          username: input.username ?? null,
+          canMessage: true,
+        },
+      });
+      return user;
     });
     return mapUser(row);
+  }
+
+  async upsertVkUser(input: {
+    vkId: string;
+    peerId: string;
+    username?: string;
+    firstName: string;
+  }): Promise<UserRecord> {
+    const row = await this.prisma.$transaction(async (tx) => {
+      const identity = await tx.messengerIdentity.findUnique({
+        where: {
+          provider_externalId: { provider: "vk", externalId: input.vkId },
+        },
+        include: { user: true },
+      });
+      if (identity) {
+        await tx.messengerIdentity.update({
+          where: { id: identity.id },
+          data: {
+            peerId: input.peerId,
+            username: input.username ?? null,
+            canMessage: true,
+          },
+        });
+        return tx.user.update({
+          where: { id: identity.userId },
+          data: {
+            username: identity.user.telegramId
+              ? identity.user.username
+              : input.username ?? identity.user.username,
+            firstName: identity.user.telegramId
+              ? identity.user.firstName
+              : input.firstName,
+          },
+        });
+      }
+      return tx.user.create({
+        data: {
+          telegramId: null,
+          username: input.username ?? null,
+          firstName: input.firstName,
+          identities: {
+            create: {
+              provider: "vk",
+              externalId: input.vkId,
+              peerId: input.peerId,
+              username: input.username ?? null,
+            },
+          },
+        },
+      });
+    });
+    return mapUser(row);
+  }
+
+  async getUserByVkId(vkId: string): Promise<UserRecord | null> {
+    const identity = await this.prisma.messengerIdentity.findUnique({
+      where: { provider_externalId: { provider: "vk", externalId: vkId } },
+      include: { user: true },
+    });
+    return identity ? mapUser(identity.user) : null;
   }
 
   async getUserByTelegramId(telegramId: string): Promise<UserRecord | null> {
@@ -153,7 +239,109 @@ export class AppDatabase {
       orderBy: { id: "asc" },
       select: { telegramId: true },
     });
-    return rows.map(({ telegramId }) => telegramId);
+    return rows.flatMap(({ telegramId }) => telegramId ? [telegramId] : []);
+  }
+
+  async createAccountLinkToken(input: {
+    userId: number;
+    provider: MessengerProvider;
+    tokenHash: string;
+    expiresAt: Date;
+  }): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.accountLinkToken.deleteMany({
+        where: {
+          userId: input.userId,
+          provider: input.provider,
+          consumedAt: null,
+        },
+      });
+      await tx.accountLinkToken.create({ data: input });
+    });
+  }
+
+  async consumeVkAccountLink(input: {
+    tokenHash: string;
+    vkId: string;
+    peerId: string;
+    username?: string;
+    firstName: string;
+    now?: Date;
+  }): Promise<UserRecord | null> {
+    const now = input.now ?? new Date();
+    const row = await this.prisma.$transaction(async (tx) => {
+      const link = await tx.accountLinkToken.findUnique({
+        where: { tokenHash: input.tokenHash },
+      });
+      if (
+        !link ||
+        link.provider !== "vk" ||
+        link.consumedAt ||
+        link.expiresAt <= now
+      ) return null;
+
+      const existingTarget = await tx.messengerIdentity.findUnique({
+        where: {
+          userId_provider: { userId: link.userId, provider: "vk" },
+        },
+      });
+      if (existingTarget && existingTarget.externalId !== input.vkId) {
+        throw new Error("К этому аккаунту уже привязана другая страница VK");
+      }
+
+      const current = await tx.messengerIdentity.findUnique({
+        where: {
+          provider_externalId: { provider: "vk", externalId: input.vkId },
+        },
+      });
+      if (current && current.userId !== link.userId) {
+        await tx.vpnConfig.updateMany({
+          where: { userId: current.userId },
+          data: { userId: link.userId },
+        });
+        await tx.messengerIdentity.update({
+          where: { id: current.id },
+          data: {
+            userId: link.userId,
+            peerId: input.peerId,
+            username: input.username ?? null,
+            canMessage: true,
+          },
+        });
+        const remaining = await tx.messengerIdentity.count({
+          where: { userId: current.userId },
+        });
+        if (remaining === 0) {
+          await tx.user.delete({ where: { id: current.userId } });
+        }
+      } else if (current) {
+        await tx.messengerIdentity.update({
+          where: { id: current.id },
+          data: {
+            peerId: input.peerId,
+            username: input.username ?? null,
+            canMessage: true,
+          },
+        });
+      } else {
+        await tx.messengerIdentity.create({
+          data: {
+            userId: link.userId,
+            provider: "vk",
+            externalId: input.vkId,
+            peerId: input.peerId,
+            username: input.username ?? null,
+          },
+        });
+      }
+
+      await tx.accountLinkToken.update({
+        where: { id: link.id },
+        data: { consumedAt: now },
+      });
+      return tx.user.findUnique({ where: { id: link.userId } });
+    });
+    return row ? mapUser(row) : null;
   }
 
   async insertConfig(config: VpnConfigRecord): Promise<void> {
