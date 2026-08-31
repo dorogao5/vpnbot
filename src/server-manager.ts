@@ -213,7 +213,7 @@ export class ServerManager {
           port: record.port,
           username: "root",
           password: rootPassword,
-          proxyUrl: this.config.sshProxyUrl,
+          proxyUrl: this.sshProxyFor(record.key),
           timeoutMs: 600_000,
         },
         `bash -se <<'VPNBOT_BOOTSTRAP_EOF'\n${script.replaceAll("SRV_KEY_PLACEHOLDER", serverKey)}\nVPNBOT_BOOTSTRAP_EOF\n`
@@ -249,7 +249,7 @@ export class ServerManager {
       privateKey: record.sshPrivateKey,
       hostFingerprint: record.hostFingerprint,
       helperCommand: this.config.helperCommand,
-      proxyUrl: this.config.sshProxyUrl,
+      proxyUrl: this.sshProxyFor(record.key),
       ...(this.config.vpnProfile.relay
         ? {
             relay: {
@@ -259,6 +259,12 @@ export class ServerManager {
           }
         : {}),
     };
+  }
+
+  private sshProxyFor(serverKey: string): string | undefined {
+    return this.config.directSshServerKeys.has(serverKey)
+      ? undefined
+      : this.config.sshProxyUrl;
   }
 
   private fallbackRecord(key: string, name: string): VpnServerRecord {

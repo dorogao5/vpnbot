@@ -24,6 +24,7 @@ const schema = z.object({
   VPN_BOOTSTRAP_PUBLIC_KEY_PATH: optionalString,
   TELEGRAM_PROXY_URL: optionalUrl,
   SSH_PROXY_URL: optionalUrl,
+  VPN_DIRECT_SSH_SERVER_KEYS: optionalString,
   VPN_RELAY_HOST: optionalString,
   VPN_RELAY_PORT: z.coerce.number().int().min(1).max(65535).optional(),
   VPN_RELAY_PORT_START: z.coerce.number().int().min(1).max(65535).default(4443),
@@ -83,6 +84,7 @@ export interface AppConfig {
   bootstrapPublicKey: string | undefined;
   telegramProxyUrl: string | undefined;
   sshProxyUrl: string | undefined;
+  directSshServerKeys: ReadonlySet<string>;
   vpnProfile: VpnProfileOptions;
   relayProvisioning: {
     host: string;
@@ -130,6 +132,17 @@ function serverFromEnv(
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = schema.parse(env);
+  const directSshServerKeys = new Set(
+    parsed.VPN_DIRECT_SSH_SERVER_KEYS
+      ?.split(",")
+      .map((key) => key.trim())
+      .filter(Boolean) ?? []
+  );
+  for (const key of directSshServerKeys) {
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(key)) {
+      throw new Error(`Некорректный ключ VPN-сервера для прямого SSH: ${key}`);
+    }
+  }
   if (Boolean(parsed.VK_GROUP_ID) !== Boolean(parsed.VK_GROUP_TOKEN)) {
     throw new Error("VK_GROUP_ID и VK_GROUP_TOKEN необходимо задавать вместе");
   }
@@ -176,7 +189,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     parsed.NEW_VPN_PRIVATE_KEY_PATH,
     parsed.NEW_VPN_HOST_FINGERPRINT,
     parsed.VPN_HELPER_COMMAND,
-    parsed.SSH_PROXY_URL
+    directSshServerKeys.has("new") ? undefined : parsed.SSH_PROXY_URL
   );
   const oldServer = serverFromEnv(
     "old",
@@ -187,7 +200,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     parsed.OLD_VPN_PRIVATE_KEY_PATH,
     parsed.OLD_VPN_HOST_FINGERPRINT,
     parsed.VPN_HELPER_COMMAND,
-    parsed.SSH_PROXY_URL
+    directSshServerKeys.has("old") ? undefined : parsed.SSH_PROXY_URL
   );
 
   return {
@@ -206,6 +219,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       : undefined,
     telegramProxyUrl: parsed.TELEGRAM_PROXY_URL,
     sshProxyUrl: parsed.SSH_PROXY_URL,
+    directSshServerKeys,
     vpnProfile: {
       relay: parsed.VPN_RELAY_HOST && parsed.VPN_RELAY_PORT
         ? { host: parsed.VPN_RELAY_HOST, port: parsed.VPN_RELAY_PORT }

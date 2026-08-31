@@ -87,6 +87,7 @@ docker compose -f compose.test.yaml down
 - `VK_GROUP_ID` и `VK_GROUP_TOKEN` — числовой ID и токен сообщества VK с правами на сообщения и документы. Если параметры отсутствуют, VK-адаптер не запускается.
 - `TELEGRAM_PROXY_URL` — SOCKS5-прокси только для Telegram Bot API.
 - `SSH_PROXY_URL` — SOCKS5-прокси для управляющих SSH-подключений к VPN-серверам.
+- `VPN_DIRECT_SSH_SERVER_KEYS` — ключи серверов через запятую, для которых управляющий SSH идёт напрямую в обход `SSH_PROXY_URL`.
 - `VPN_RELAY_HOST` и `VPN_RELAY_PORT` — публичная точка входа, которой бот заменяет `remote` во всех выдаваемых `.ovpn`.
 - `VPN_RELAY_PORT_START/END` — диапазон отдельных публичных TCP-портов российского relay для VPS, добавленных через админку.
 - `VPN_RELAY_SSH_*`, `VPN_RELAY_TUNNEL_PRIVATE_KEY_PATH` и `VPN_RELAY_HOST_PUBLIC_KEY_PATH` — ограниченный SSH-доступ для постоянных обратных туннелей с новых VPS на российский relay.

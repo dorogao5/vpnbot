@@ -23,6 +23,7 @@ const appConfig: AppConfig = {
   bootstrapPublicKey: undefined,
   telegramProxyUrl: undefined,
   sshProxyUrl: undefined,
+  directSshServerKeys: new Set(),
   vpnProfile: { relay: undefined, blockIpv6: false },
   relayProvisioning: undefined,
   envServers: {},

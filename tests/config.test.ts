@@ -23,3 +23,23 @@ describe("VK config", () => {
       .toThrow("VK_GROUP_ID и VK_GROUP_TOKEN");
   });
 });
+
+describe("SSH routing config", () => {
+  it("разбирает список серверов с прямым SSH", () => {
+    const config = loadConfig({
+      ...baseEnv,
+      SSH_PROXY_URL: "socks5h://127.0.0.1:1081",
+      VPN_DIRECT_SSH_SERVER_KEYS: "srv_1, old",
+    });
+
+    expect([...config.directSshServerKeys]).toEqual(["srv_1", "old"]);
+    expect(config.sshProxyUrl).toBe("socks5h://127.0.0.1:1081");
+  });
+
+  it("отклоняет некорректный ключ сервера", () => {
+    expect(() => loadConfig({
+      ...baseEnv,
+      VPN_DIRECT_SSH_SERVER_KEYS: "srv_1, bad key",
+    })).toThrow("Некорректный ключ VPN-сервера");
+  });
+});

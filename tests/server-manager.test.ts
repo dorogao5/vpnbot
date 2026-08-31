@@ -27,6 +27,7 @@ const appConfig: AppConfig = {
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtest vpnbot-bootstrap",
   telegramProxyUrl: undefined,
   sshProxyUrl: undefined,
+  directSshServerKeys: new Set(),
   vpnProfile: { relay: undefined, blockIpv6: false },
   relayProvisioning: {
     host: "relay.example.com",
@@ -173,5 +174,32 @@ describe("ServerManager", () => {
     await expect(manager.serverName("old")).resolves.toBe("Старый из БД");
     await db.updateServer("old", { name: "Переименованный" });
     await expect(manager.serverName("old")).resolves.toBe("Переименованный");
+  });
+
+  it("отключает SSH-прокси только для перечисленного сервера", async () => {
+    const directManager = new ServerManager(db, {} as OpenVpnGateway, {
+      ...appConfig,
+      sshProxyUrl: "socks5h://172.30.0.1:1081",
+      directSshServerKeys: new Set(["srv_1"]),
+    });
+    for (const [key, host] of [["srv_1", "10.0.0.1"], ["srv_2", "10.0.0.2"]] as const) {
+      await db.createServerPlaceholder({
+        key,
+        name: key,
+        host,
+        port: 22,
+        sshUser: "vpn-bot",
+        sshPrivateKey: "private-key",
+        hostFingerprint: `SHA256:${key}`,
+      });
+      await db.updateServer(key, { status: "ready", enabled: true });
+    }
+
+    await expect(directManager.resolveTarget("srv_1")).resolves.toMatchObject({
+      proxyUrl: undefined,
+    });
+    await expect(directManager.resolveTarget("srv_2")).resolves.toMatchObject({
+      proxyUrl: "socks5h://172.30.0.1:1081",
+    });
   });
 });
