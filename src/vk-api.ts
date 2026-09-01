@@ -1,6 +1,8 @@
 import { randomInt } from "node:crypto";
 
 const VK_API_VERSION = "5.199";
+const DOCUMENT_UPLOAD_ATTEMPTS = 3;
+const DOCUMENT_UPLOAD_RETRY_DELAY_MS = 500;
 
 export interface VkLongPollServer {
   key: string;
@@ -104,6 +106,20 @@ export class VkApiClient {
     });
   }
 
+  async editMessage(input: {
+    peerId: number;
+    conversationMessageId: number;
+    message: string;
+    keyboard?: string;
+  }): Promise<void> {
+    await this.call("messages.edit", {
+      peer_id: input.peerId,
+      cmid: input.conversationMessageId,
+      message: input.message,
+      ...(input.keyboard ? { keyboard: input.keyboard } : {}),
+    });
+  }
+
   async answerMessageEvent(input: {
     eventId: string;
     userId: number;
@@ -113,7 +129,6 @@ export class VkApiClient {
       event_id: input.eventId,
       user_id: input.userId,
       peer_id: input.peerId,
-      event_data: JSON.stringify({ type: "show_snackbar", text: "Готово" }),
     });
   }
 
@@ -123,6 +138,32 @@ export class VkApiClient {
     fileName: string;
     message: string;
   }): Promise<void> {
+    let attachment: string | undefined;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= DOCUMENT_UPLOAD_ATTEMPTS; attempt += 1) {
+      try {
+        attachment = await this.uploadDocument(input);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < DOCUMENT_UPLOAD_ATTEMPTS) {
+          await delay(DOCUMENT_UPLOAD_RETRY_DELAY_MS * attempt);
+        }
+      }
+    }
+    if (!attachment) throw lastError;
+    await this.sendMessage({
+      peerId: input.peerId,
+      message: input.message,
+      attachment,
+    });
+  }
+
+  private async uploadDocument(input: {
+    peerId: number;
+    file: Buffer;
+    fileName: string;
+  }): Promise<string> {
     const upload = await this.call<{ upload_url: string }>(
       "docs.getMessagesUploadServer",
       { type: "doc", peer_id: input.peerId }
@@ -140,19 +181,24 @@ export class VkApiClient {
     if (!uploadedResponse.ok) {
       throw new Error(`VK upload вернул HTTP ${uploadedResponse.status}`);
     }
-    const uploaded = await uploadedResponse.json() as { file?: string };
-    if (!uploaded.file) throw new Error("VK upload не вернул идентификатор файла");
+    const uploaded = await uploadedResponse.json() as {
+      file?: string;
+      error?: string;
+      error_msg?: string;
+    };
+    if (!uploaded.file) {
+      const reason = uploaded.error_msg ?? uploaded.error;
+      throw new Error(
+        `VK upload не вернул идентификатор файла${reason ? `: ${reason}` : ""}`
+      );
+    }
 
     const saved = await this.call<unknown>("docs.save", {
       file: uploaded.file,
       title: input.fileName,
     });
     const document = savedDocument(saved);
-    await this.sendMessage({
-      peerId: input.peerId,
-      message: input.message,
-      attachment: `doc${document.ownerId}_${document.id}`,
-    });
+    return `doc${document.ownerId}_${document.id}`;
   }
 
   private async call<T = unknown>(
@@ -179,6 +225,10 @@ export class VkApiClient {
     }
     return envelope.response as T;
   }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function savedDocument(value: unknown): { id: number; ownerId: number } {

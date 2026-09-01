@@ -14,6 +14,7 @@ import {
 } from "./vk-api.js";
 
 const CONFIG_PAGE_SIZE = 5;
+const BULK_FILE_DELAY_MS = 500;
 const LINK_REQUIRED_MESSAGE = [
   "🔗 Сначала свяжите VK с Telegram.",
   "",
@@ -31,6 +32,7 @@ interface VkMessageEvent {
   event_id: string;
   user_id: number;
   peer_id: number;
+  conversation_message_id?: number;
   payload?: unknown;
 }
 
@@ -126,7 +128,8 @@ export class VkBot {
       await this.handleAction(
         event.user_id,
         event.peer_id,
-        parseAction(event.payload)
+        parseAction(event.payload),
+        event.conversation_message_id
       );
     }
   }
@@ -211,64 +214,90 @@ export class VkBot {
   private async handleAction(
     vkId: number,
     peerId: number,
-    action: VkAction | null
+    action: VkAction | null,
+    conversationMessageId?: number
   ): Promise<void> {
     const user = await this.db.getUserByVkId(String(vkId));
-    if (!user || vkRequiresTelegramLink(user)) return this.showLinkRequired(peerId);
-    if (!action) return this.showMain(peerId);
+    if (!user || vkRequiresTelegramLink(user)) {
+      return this.showLinkRequired(peerId, conversationMessageId);
+    }
+    if (!action) return this.showMain(peerId, conversationMessageId);
 
-    if (action.a === "main") return this.showMain(peerId);
-    if (action.a === "help") return this.showHelp(peerId);
+    if (action.a === "main") return this.showMain(peerId, conversationMessageId);
+    if (action.a === "help") return this.showHelp(peerId, conversationMessageId);
     if (action.a === "list") {
-      return this.showConfigs(user.id, peerId, action.page ?? 0);
+      return this.showConfigs(
+        user.id,
+        peerId,
+        action.page ?? 0,
+        conversationMessageId
+      );
     }
     if (action.a === "all") return this.downloadAll(user.id, vkId, peerId);
-    if (!action.id) return this.showMain(peerId);
+    if (!action.id) return this.showMain(peerId, conversationMessageId);
 
     const config = await this.db.getConfig(action.id);
     if (!config || config.userId !== user.id || config.status === "revoked") {
-      await this.api.sendMessage({
+      await this.sendOrEdit({
         peerId,
+        conversationMessageId,
         message: "Конфиг не найден.",
         keyboard: mainKeyboard(),
       });
       return;
     }
-    if (action.a === "cfg") return this.showConfig(config, peerId);
+    if (action.a === "cfg") {
+      return this.showConfig(config, peerId, conversationMessageId);
+    }
     if (action.a === "download") return this.download(config, peerId);
     if (action.a === "rename") {
       this.pendingRename.set(String(vkId), config.id);
-      await this.api.sendMessage({
+      await this.sendOrEdit({
         peerId,
+        conversationMessageId,
         message: `Отправьте новое название для «${config.displayName}» — от 1 до 40 символов.`,
         keyboard: keyboard([[button("Отмена", { a: "cfg", id: config.id })]]),
       });
       return;
     }
-    if (action.a === "reissue") return this.showReissueServers(config, peerId);
+    if (action.a === "reissue") {
+      return this.showReissueServers(config, peerId, conversationMessageId);
+    }
     if (action.a === "reissue-confirm" && action.server) {
       return this.reissue(config, action.server, peerId);
     }
   }
 
-  private async showMain(peerId: number): Promise<void> {
-    await this.api.sendMessage({
+  private async showMain(
+    peerId: number,
+    conversationMessageId?: number
+  ): Promise<void> {
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: "👋 VPN-бот\n\nЗдесь можно получить конфиги, проверить срок действия и перевыпустить файл.",
       keyboard: mainKeyboard(),
     });
   }
 
-  private async showLinkRequired(peerId: number): Promise<void> {
-    await this.api.sendMessage({
+  private async showLinkRequired(
+    peerId: number,
+    conversationMessageId?: number
+  ): Promise<void> {
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: LINK_REQUIRED_MESSAGE,
     });
   }
 
-  private async showHelp(peerId: number): Promise<void> {
-    await this.api.sendMessage({
+  private async showHelp(
+    peerId: number,
+    conversationMessageId?: number
+  ): Promise<void> {
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: [
         "ℹ️ Как подключиться",
         "",
@@ -285,7 +314,8 @@ export class VkBot {
   private async showConfigs(
     userId: number,
     peerId: number,
-    requestedPage: number
+    requestedPage: number,
+    conversationMessageId?: number
   ): Promise<void> {
     const configs = await this.db.listVisibleConfigs(userId);
     const totalPages = Math.max(1, Math.ceil(configs.length / CONFIG_PAGE_SIZE));
@@ -294,37 +324,29 @@ export class VkBot {
       page * CONFIG_PAGE_SIZE,
       (page + 1) * CONFIG_PAGE_SIZE
     );
-    const rows: VkButton[][] = items.map((config) => [
-      button(
-        `${isExpired(config.expiresAt) || config.status !== "active" ? "🔴" : "🟢"} ${config.displayName}`,
-        { a: "cfg", id: config.id }
-      ),
-    ]);
-    if (totalPages > 1) {
-      const pagination: VkButton[] = [];
-      if (page > 0) pagination.push(button("←", { a: "list", page: page - 1 }));
-      if (page + 1 < totalPages)
-        pagination.push(button("→", { a: "list", page: page + 1 }));
-      rows.push(pagination);
-    }
-    rows.push([button("Главное меню", { a: "main" })]);
-    await this.api.sendMessage({
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: configs.length
         ? `🔐 Ваши конфиги: ${configs.length}\nСтраница ${page + 1} из ${totalPages}`
         : "У Вас пока нет VPN-конфигов. Обратитесь к администратору после оплаты.",
-      keyboard: keyboard(rows),
+      keyboard: configListKeyboard(items, page, totalPages),
     });
   }
 
-  private async showConfig(config: VpnConfigRecord, peerId: number): Promise<void> {
+  private async showConfig(
+    config: VpnConfigRecord,
+    peerId: number,
+    conversationMessageId?: number
+  ): Promise<void> {
     const [traffic, serverName] = await Promise.all([
       this.trafficService.forConfig(config),
       this.serverManager.serverName(config.serverKey),
     ]);
     const active = config.status === "active" && !isExpired(config.expiresAt);
-    await this.api.sendMessage({
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: [
         `🔐 ${config.displayName}`,
         `Статус: ${active ? "🟢 действует" : "🔴 срок истёк"}`,
@@ -370,7 +392,13 @@ export class VkBot {
     peerId: number
   ): Promise<void> {
     const lock = `all:${vkId}`;
-    if (this.operationLocks.has(lock)) return;
+    if (this.operationLocks.has(lock)) {
+      await this.api.sendMessage({
+        peerId,
+        message: "Файлы уже подготавливаются. Дождитесь итогового сообщения.",
+      });
+      return;
+    }
     this.operationLocks.add(lock);
     try {
       const configs = (await this.db.listVisibleConfigs(userId)).filter(
@@ -402,6 +430,7 @@ export class VkBot {
         } catch (error) {
           console.error(`Не удалось массово отправить VK-файл ${config.id}`, error);
         }
+        await pause(BULK_FILE_DELAY_MS);
       }
       await this.api.sendMessage({
         peerId,
@@ -415,11 +444,13 @@ export class VkBot {
 
   private async showReissueServers(
     config: VpnConfigRecord,
-    peerId: number
+    peerId: number,
+    conversationMessageId?: number
   ): Promise<void> {
     if (config.status !== "active" || isExpired(config.expiresAt)) {
-      await this.api.sendMessage({
+      await this.sendOrEdit({
         peerId,
+        conversationMessageId,
         message: "Просроченный конфиг нельзя перевыпустить.",
         keyboard: configKeyboard(config.id, false),
       });
@@ -432,15 +463,17 @@ export class VkBot {
         server.record.key !== config.serverKey
     );
     if (servers.length === 0) {
-      await this.api.sendMessage({
+      await this.sendOrEdit({
         peerId,
+        conversationMessageId,
         message: "Сейчас нет другого доступного сервера для перевыпуска.",
         keyboard: configKeyboard(config.id),
       });
       return;
     }
-    await this.api.sendMessage({
+    await this.sendOrEdit({
       peerId,
+      conversationMessageId,
       message: "Выберите сервер для нового файла. Старый профиль будет работать ещё примерно пять минут.",
       keyboard: keyboard([
         ...servers.map((server) => [
@@ -504,6 +537,35 @@ export class VkBot {
     this.profiles.set(userId, profile);
     return profile;
   }
+
+  private async sendOrEdit(input: {
+    peerId: number;
+    conversationMessageId?: number | undefined;
+    message: string;
+    keyboard?: string;
+  }): Promise<void> {
+    if (input.conversationMessageId !== undefined) {
+      try {
+        await this.api.editMessage({
+          peerId: input.peerId,
+          conversationMessageId: input.conversationMessageId,
+          message: input.message,
+          ...(input.keyboard ? { keyboard: input.keyboard } : {}),
+        });
+        return;
+      } catch (error) {
+        console.error(
+          `Не удалось отредактировать VK-сообщение ${input.conversationMessageId}`,
+          error
+        );
+      }
+    }
+    await this.api.sendMessage({
+      peerId: input.peerId,
+      message: input.message,
+      ...(input.keyboard ? { keyboard: input.keyboard } : {}),
+    });
+  }
 }
 
 export function vkRequiresTelegramLink(
@@ -518,6 +580,29 @@ function mainKeyboard(): string {
     [button("📦 Получить все файлы", { a: "all" }, "positive")],
     [button("ℹ️ Помощь", { a: "help" })],
   ]);
+}
+
+export function configListKeyboard(
+  configs: Array<
+    Pick<VpnConfigRecord, "id" | "displayName" | "expiresAt" | "status">
+  >,
+  page: number,
+  totalPages: number
+): string {
+  const rows: VkButton[][] = configs.map((config) => [
+    button(
+      `${isExpired(config.expiresAt) || config.status !== "active" ? "🔴" : "🟢"} ${config.displayName}`,
+      { a: "cfg", id: config.id }
+    ),
+  ]);
+  const navigation: VkButton[] = [];
+  if (page > 0) navigation.push(button("←", { a: "list", page: page - 1 }));
+  if (page + 1 < totalPages) {
+    navigation.push(button("→", { a: "list", page: page + 1 }));
+  }
+  navigation.push(button("Главное меню", { a: "main" }));
+  rows.push(navigation);
+  return keyboard(rows);
 }
 
 function configKeyboard(configId: string, active = true): string {
@@ -590,7 +675,11 @@ function parseMessageEvent(
   if (
     typeof event.event_id !== "string" ||
     !Number.isInteger(event.user_id) ||
-    !Number.isInteger(event.peer_id)
+    !Number.isInteger(event.peer_id) ||
+    (
+      event.conversation_message_id !== undefined &&
+      !Number.isInteger(event.conversation_message_id)
+    )
   ) return null;
   return event as VkMessageEvent;
 }
@@ -623,4 +712,8 @@ function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
     }, milliseconds);
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function pause(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
