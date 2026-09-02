@@ -7,6 +7,8 @@ export async function createCleanDatabase(): Promise<AppDatabase> {
   const db = new AppDatabase(databaseUrl);
   await db.prisma.$transaction([
     db.prisma.configRequest.deleteMany(),
+    db.prisma.accountLinkToken.deleteMany(),
+    db.prisma.messengerIdentity.deleteMany(),
     db.prisma.pendingRevocation.deleteMany(),
     db.prisma.trafficEvent.deleteMany(),
     db.prisma.notification.deleteMany(),

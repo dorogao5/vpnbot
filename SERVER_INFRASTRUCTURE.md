@@ -1,8 +1,8 @@
 # Серверная архитектура и пошаговое развёртывание
 
-Документ фиксирует рабочую production-схему на 26 августа 2026 года и объясняет, как воспроизвести её на других серверах. Внутренняя логика Telegram-бота описана отдельно в [BOT_INTERNALS.md](BOT_INTERNALS.md).
+Документ фиксирует рабочую production-схему на 1 сентября 2026 года и объясняет, как воспроизвести её на других серверах. Внутренняя логика Telegram/VK-бота описана отдельно в [BOT_INTERNALS.md](BOT_INTERNALS.md), а короткий операционный порядок первого запуска и обновления — в [DEPLOYMENT_RUNBOOK.md](DEPLOYMENT_RUNBOOK.md).
 
-Здесь намеренно используются заполнители. Не копируйте в Git реальные IP, пароли, Telegram token, приватные ключи, SSH fingerprint, содержимое `.env`, дампы PostgreSQL и OpenVPN PKI.
+Здесь намеренно используются заполнители. Не копируйте в Git реальные IP, пароли, Telegram/VK tokens, приватные ключи, SSH fingerprint, содержимое `.env`, дампы PostgreSQL и OpenVPN PKI.
 
 ## 1. Что построено
 
@@ -250,14 +250,22 @@ DATABASE_URL=postgresql://vpnbot:<URL_ENCODED_POSTGRES_PASSWORD>@postgres:5432/v
 TIMEZONE=Europe/Moscow
 REMINDER_HOUR=10
 
+VK_GROUP_ID=<VK_COMMUNITY_ID>
+VK_GROUP_TOKEN=<VK_COMMUNITY_TOKEN>
+
 TELEGRAM_PROXY_URL=socks5h://172.30.0.1:1080
 SSH_PROXY_URL=socks5h://172.30.0.1:1081
+VPN_DIRECT_SSH_SERVER_KEYS=<RU_VPN_SERVER_KEY>
 VPN_RELAY_HOST=<RU_PUBLIC_IP>
 VPN_RELAY_PORT=443
 VPN_BLOCK_IPV6=true
 ```
 
 Если пароль содержит `@`, `:`, `/`, `%` или другие специальные символы URI, percent-encode его только внутри `DATABASE_URL`; `POSTGRES_PASSWORD` остаётся исходным.
+
+`VK_GROUP_ID` и `VK_GROUP_TOKEN` задаются только вместе. В сообществе должны быть включены сообщения, Bots Long Poll API 5.199 и события `message_new`, `message_event`, `message_allow`, `message_deny`; публичный callback endpoint не требуется. Token сообщества должен разрешать сообщения и документы.
+
+`VPN_DIRECT_SSH_SERVER_KEYS` содержит внутренний ключ московского VPN-сервера, например `srv_1`, а не отображаемое имя. Остальные VPN-серверы продолжают использовать `SSH_PROXY_URL`. Если прямых серверов несколько, перечислите ключи через запятую.
 
 Параметры `NEW_VPN_*`, `OLD_VPN_*` и автоматического relay заполняйте только для реально подключаемых серверов. Полный список и комментарии находятся в `.env.example`.
 
@@ -273,7 +281,7 @@ docker compose logs --tail=200 bot
 docker compose exec bot npx prisma migrate status
 ```
 
-Ожидаются healthy PostgreSQL, запущенный bot и отсутствие ошибок миграции. До появления SOCKS бот может перезапускаться из-за недоступности Telegram — сначала завершите раздел 8.
+Ожидаются healthy PostgreSQL, запущенный bot, отсутствие ошибок миграции и строки `VPN-бот запущен` и `VK-бот запущен для сообщества ...`. После старта отдельно проверьте, что в логах не повторяется `Ошибка VK Long Poll`. До появления SOCKS бот может перезапускаться из-за недоступности Telegram — сначала завершите раздел 8. VK при этом использует прямое исходящее соединение российского сервера, а не `TELEGRAM_PROXY_URL`.
 
 ## 8. Reverse SOCKS из FI для Telegram и SSH
 
@@ -709,6 +717,7 @@ NEW_VPN_USER=vpn-bot
 NEW_VPN_PRIVATE_KEY_PATH=/run/secrets/new_vpn_ssh_key
 NEW_VPN_HOST_FINGERPRINT=SHA256:<VERIFIED_FINGERPRINT>
 VPN_HELPER_COMMAND=sudo /usr/local/sbin/openvpn-bot-helper
+VPN_DIRECT_SSH_SERVER_KEYS=new
 ```
 
 5. Перезапустите контейнер и проверьте логи:
@@ -721,7 +730,7 @@ docker compose logs --tail=200 bot
 
 6. В админке проверьте статус, затем выполните тестовый полный цикл: выдача → скачивание → подключение → трафик → отзыв.
 
-Если `RU` не может соединиться с собственным публичным IP через SOCKS `FI`, для `NEW_VPN_HOST` используйте специально разрешённый достижимый адрес/маршрут, но host fingerprint должен соответствовать именно этому SSH endpoint.
+Если `RU` не может соединиться с собственным публичным IP через SOCKS `FI`, добавьте внутренний ключ этого сервера (`new` для `NEW_VPN_*` или фактический ключ записи `VpnServer`) в `VPN_DIRECT_SSH_SERVER_KEYS`. При необходимости для `NEW_VPN_HOST` используйте специально разрешённый достижимый адрес/маршрут, но host fingerprint должен соответствовать именно этому SSH endpoint. Не отключайте `SSH_PROXY_URL` глобально, если удалённые VPS доступны только через финский tunnel.
 
 ## 15. Полная приёмочная проверка
 
@@ -730,7 +739,12 @@ docker compose logs --tail=200 bot
 - `/start` получает ответ без задержки;
 - контейнеры остаются `Up`, миграции применены;
 - админка видит один активный сервер;
+- непривязанный VK-пользователь на любой текст и старый callback получает только инструкцию взять код в Telegram;
+- код из Telegram отображается моноширно, неверный код не меняет данные, а корректный связывает аккаунты;
+- после привязки VK и Telegram показывают один список конфигов, а `.ovpn` скачивается из обоих каналов;
+- в логах нет повторяющихся ошибок Telegram polling или VK Long Poll;
 - helper выполняет `list`, `create`, `download`, `revoke`;
+- московский helper вызывается напрямую, а контрольный удалённый target — через `SSH_PROXY_URL`;
 - root-пароль нигде не появился в `.env`, БД или логах;
 - после перезапуска контейнеров пользователи и сроки сохраняются.
 
@@ -822,14 +836,14 @@ systemctl start vpnbot-update-ru-routes.service
 
 ### 17.3. Новая версия бота не стартует
 
-Не используйте `prisma migrate reset` или `db push` в production. Сохраните `pg_dump`, верните предыдущий Git commit/образ и выполните:
+Не используйте `prisma migrate reset` или `db push` в production. Сохраните `pg_dump`, верните согласованные предыдущий Git commit и Docker-образ и выполните:
 
 ```bash
 docker compose up -d --build bot
 docker compose logs --tail=200 bot
 ```
 
-Миграции проектируются вперёд-совместимыми; ручной SQL rollback возможен только после анализа конкретной миграции.
+Миграции проектируются вперёд-совместимыми; ручной SQL rollback возможен только после анализа конкретной миграции. Подробный порядок backup, переключения и smoke-проверок находится в [DEPLOYMENT_RUNBOOK.md](DEPLOYMENT_RUNBOOK.md).
 
 ### 17.4. Повреждение БД
 
@@ -859,6 +873,7 @@ Root-пароль не сохраняется. Используется зафи
 Ежедневно или внешним мониторингом проверяйте:
 
 - Telegram heartbeat бота;
+- ответ VK-бота и отсутствие повторяющихся `Ошибка VK Long Poll`;
 - `docker compose ps` и ошибки bot/PostgreSQL;
 - свободное место и размер Docker volume;
 - возраст последнего PostgreSQL backup и тест восстановления;
@@ -886,6 +901,7 @@ docker compose -f /opt/vpnbot/app/compose.yaml logs --tail=200 bot
 Ротируйте роли независимо:
 
 - BotFather token → `.env` → restart bot;
+- VK community token → `VK_GROUP_TOKEN` в `.env` → recreate bot → проверка Long Poll и отправки документа → отзыв старого token;
 - PostgreSQL password → роль PostgreSQL и обе переменные `.env` согласованно;
 - control SSH key → сначала добавить новый public key, обновить secret/настройку, проверить, затем удалить старый;
 - reverse relay key → сначала добавить новый key на `RU`, обновить `FI`, проверить оба tunnel service, затем удалить старый;
@@ -907,9 +923,10 @@ docker compose -f /opt/vpnbot/app/compose.yaml logs --tail=200 bot
 После изменений:
 
 1. Проверить systemd и Docker.
-2. Проверить Telegram отдельно от управляющего SSH.
-3. Выпустить отдельный тестовый сертификат.
-4. Проверить RU, foreign и fallback-маршруты.
-5. Отозвать тестовый сертификат и убедиться, что он больше не подключается.
-6. Проверить импорт трафика.
-7. Обновить оба MD-документа, если изменилась архитектура или бизнес-логика.
+2. Проверить Telegram, VK и управляющий SSH как три независимых канала.
+3. Проверить непривязанный VK, одноразовый код и общий список после привязки.
+4. Выпустить отдельный тестовый сертификат.
+5. Проверить RU, foreign и fallback-маршруты.
+6. Отозвать тестовый сертификат и убедиться, что он больше не подключается.
+7. Проверить импорт трафика.
+8. Обновить `DEPLOYMENT_RUNBOOK.md`, `BOT_INTERNALS.md` и этот документ, если изменилась архитектура или бизнес-логика.

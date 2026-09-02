@@ -7,6 +7,8 @@ import { BackgroundJobs } from "./jobs.js";
 import { OpenVpnGateway } from "./openvpn.js";
 import { ServerManager } from "./server-manager.js";
 import { TrafficService } from "./traffic-service.js";
+import { VkApiClient } from "./vk-api.js";
+import { VkBot } from "./vk-bot.js";
 
 const config = loadConfig();
 const db = new AppDatabase(config.databaseUrl);
@@ -18,6 +20,16 @@ const configService = new ConfigService(db, vpn, serverManager, config.vpnProfil
 const trafficService = new TrafficService(db, vpn, serverManager);
 const { bot } = createBot(config, db, configService, trafficService, serverManager);
 const jobs = new BackgroundJobs(bot, db, vpn, config, trafficService, serverManager);
+const vkBot = config.vk
+  ? new VkBot(
+      new VkApiClient(config.vk.token, config.vk.groupId),
+      db,
+      configService,
+      trafficService,
+      serverManager,
+      config.timezone
+    )
+  : null;
 
 const recoveredRequests = await db.releaseProcessingConfigRequests();
 if (recoveredRequests > 0) {
@@ -48,6 +60,7 @@ async function shutdown(signal: string): Promise<void> {
   stopping = true;
   console.info(`Получен ${signal}, завершаю работу`);
   jobs.stop();
+  vkBot?.stop();
   await bot.stop();
   await db.close();
 }
@@ -61,10 +74,14 @@ try {
   ]);
   jobs.start();
   console.info("VPN-бот запущен");
-  await bot.start({ allowed_updates: ["message", "callback_query"] });
+  await Promise.all([
+    bot.start({ allowed_updates: ["message", "callback_query"] }),
+    ...(vkBot ? [vkBot.start()] : []),
+  ]);
 } catch (error) {
   console.error("Не удалось запустить VPN-бота", error);
   jobs.stop();
+  vkBot?.stop();
   await db.close();
   process.exitCode = 1;
 }

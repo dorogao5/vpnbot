@@ -9,7 +9,7 @@ export type ConfigRequestStatus =
 
 export interface UserRecord {
   id: number;
-  telegramId: string;
+  telegramId: string | null;
   username: string | null;
   firstName: string;
   createdAt: string;

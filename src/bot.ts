@@ -2,6 +2,7 @@ import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
 import type { MessageEntity } from "grammy/types";
 import { DateTime } from "luxon";
 import { SocksProxyAgent } from "socks-proxy-agent";
+import { createVkAccountLinkCode } from "./account-link.js";
 import type { AppConfig } from "./config.js";
 import { broadcastText } from "./broadcast-service.js";
 import { ConfigService } from "./config-service.js";
@@ -120,7 +121,8 @@ export function createBot(
       {
         reply_markup: mainKeyboard(
           isAdmin(ctx, appConfig),
-          appConfig.contactUrl
+          appConfig.contactUrl,
+          Boolean(appConfig.vk)
         ),
       }
     );
@@ -134,7 +136,8 @@ export function createBot(
       await ctx.reply("Выберите действие с помощью кнопок ниже.", {
         reply_markup: mainKeyboard(
           isAdmin(ctx, appConfig),
-          appConfig.contactUrl
+          appConfig.contactUrl,
+          Boolean(appConfig.vk)
         ),
       });
       return;
@@ -362,7 +365,37 @@ export function createBot(
     await edit(
       ctx,
       "🏠 Личный кабинет",
-      mainKeyboard(isAdmin(ctx, appConfig), appConfig.contactUrl)
+      mainKeyboard(
+        isAdmin(ctx, appConfig),
+        appConfig.contactUrl,
+        Boolean(appConfig.vk)
+      )
+    );
+  });
+
+  bot.callbackQuery("lvk", async (ctx) => {
+    if (!appConfig.vk) return showAlert(ctx, "Интеграция VK пока не настроена.");
+    const user = await db.getUserByTelegramId(String(ctx.from.id));
+    if (!user) return showAlert(ctx, "Пользователь не найден.");
+    const code = await createVkAccountLinkCode(db, user.id);
+    const text = [
+      "🔗 Связать VK",
+      "",
+      "Откройте диалог с нашим сообществом VK и отправьте этот одноразовый код отдельным сообщением:",
+      "",
+      code,
+      "",
+      "Код действует 10 минут и сработает только один раз.",
+    ].join("\n");
+    await ctx.answerCallbackQuery();
+    await edit(
+      ctx,
+      text,
+      new InlineKeyboard()
+        .url("Открыть VK", `https://vk.com/write-${appConfig.vk.groupId}`)
+        .row()
+        .text("⬅️ Главное меню", "m"),
+      [{ type: "code", offset: text.indexOf(code), length: code.length }]
     );
   });
 
@@ -571,7 +604,8 @@ export function createBot(
         {
           reply_markup: mainKeyboard(
             isAdmin(ctx, appConfig),
-            appConfig.contactUrl
+            appConfig.contactUrl,
+            Boolean(appConfig.vk)
           ),
         }
       );
@@ -921,18 +955,20 @@ export function createBot(
     if (!(await db.rejectConfigRequest(requestId)))
       return showAlert(ctx, "Заявка уже обработана.");
     await ctx.answerCallbackQuery({ text: "Заявка отклонена." });
-    await bot.api
-      .sendMessage(
-        user.telegramId,
-        "Заявка на новый VPN-конфиг отклонена. Если это произошло по ошибке, свяжитесь с администратором.",
-        {
-          reply_markup: new InlineKeyboard()
-            .url("💬 Связаться с администратором", appConfig.contactUrl)
-            .row()
-            .text("🏠 Главное меню", "m"),
-        }
-      )
-      .catch(logError);
+    if (user.telegramId) {
+      await bot.api
+        .sendMessage(
+          user.telegramId,
+          "Заявка на новый VPN-конфиг отклонена. Если это произошло по ошибке, свяжитесь с администратором.",
+          {
+            reply_markup: new InlineKeyboard()
+              .url("💬 Связаться с администратором", appConfig.contactUrl)
+              .row()
+              .text("🏠 Главное меню", "m"),
+          }
+        )
+        .catch(logError);
+    }
     await edit(
       ctx,
       `❌ Заявка #${requestId} от ${userLabel(user)} отклонена.`,
@@ -1355,7 +1391,7 @@ export function createBot(
       const targetName = targetServer.record.name;
       const user = await db.getUserById(config.userId);
 
-      if (user) {
+      if (user?.telegramId) {
         await bot.api
           .sendDocument(
             user.telegramId,
@@ -1551,7 +1587,7 @@ export function createBot(
     try {
       await configService.revoke(config);
       const user = await db.getUserById(config.userId);
-      if (user) {
+      if (user?.telegramId) {
         await bot.api
           .sendMessage(
             user.telegramId,
@@ -1583,13 +1619,18 @@ export function createBot(
   return { bot };
 }
 
-function mainKeyboard(admin: boolean, contactUrl: string): InlineKeyboard {
+function mainKeyboard(
+  admin: boolean,
+  contactUrl: string,
+  vkEnabled = false
+): InlineKeyboard {
   const keyboard = new InlineKeyboard().text("🗂 Мои конфиги", "ul").row();
   if (!admin) keyboard.text("📨 Запросить новый конфиг", "cr").row();
   keyboard
     .url("💳 Оплатить или продлить", contactUrl)
     .row()
     .text("📖 Как установить", "help");
+  if (vkEnabled) keyboard.row().text("🔗 Связать VK", "lvk");
   if (admin) keyboard.row().text("🛠 Админ-панель", "a");
   return keyboard;
 }
@@ -2211,6 +2252,7 @@ async function notifyConfigReady(
   appConfig: AppConfig,
   prefix: string
 ): Promise<void> {
+  if (!user.telegramId) return;
   await ctx.api
     .sendMessage(
       user.telegramId,
@@ -2367,6 +2409,7 @@ async function deliverRequestedConfig(
   appConfig: AppConfig,
   serverName: string
 ): Promise<boolean> {
+  if (!user.telegramId) return false;
   try {
     await ctx.api.sendDocument(
       user.telegramId,
@@ -2399,9 +2442,10 @@ async function deliverRequestedConfig(
 }
 
 function userLabel(user: UserRecord): string {
+  const identity = user.telegramId ?? "без Telegram";
   return user.username
-    ? `@${user.username} (${user.telegramId})`
-    : `${user.firstName} (${user.telegramId})`;
+    ? `@${user.username} (${identity})`
+    : `${user.firstName} (${identity})`;
 }
 
 function isAdmin(ctx: Context, config: AppConfig): boolean {
@@ -2486,14 +2530,21 @@ function trafficServerLines(
 async function edit(
   ctx: Context,
   text: string,
-  keyboard: InlineKeyboard
+  keyboard: InlineKeyboard,
+  entities?: MessageEntity[]
 ): Promise<void> {
   try {
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await ctx.editMessageText(text, {
+      reply_markup: keyboard,
+      ...(entities ? { entities } : {}),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.includes("message is not modified"))
-      await ctx.reply(text, { reply_markup: keyboard });
+      await ctx.reply(text, {
+        reply_markup: keyboard,
+        ...(entities ? { entities } : {}),
+      });
   }
 }
 

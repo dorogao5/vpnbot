@@ -56,6 +56,51 @@ describe("AppDatabase с Prisma", () => {
     });
   });
 
+  it("создаёт отдельного VK-пользователя без фиктивного Telegram ID", async () => {
+    const user = await db.upsertVkUser({
+      vkId: "700",
+      peerId: "700",
+      username: "vk-user",
+      firstName: "Виктор",
+    });
+
+    expect(user.telegramId).toBeNull();
+    expect((await db.getUserByVkId("700"))?.id).toBe(user.id);
+    expect(await db.listBroadcastRecipients("100")).toEqual([]);
+  });
+
+  it("объединяет VK и Telegram через одноразовый код, сохраняя конфиги", async () => {
+    const telegram = await db.upsertUser({
+      telegramId: "100",
+      firstName: "Иван",
+    });
+    const vk = await db.upsertVkUser({
+      vkId: "700",
+      peerId: "700",
+      firstName: "Иван",
+    });
+    const config = testConfig(vk.id, "vk-client", "2026-12-31T20:59:59.999Z");
+    await db.insertConfig(config);
+    await db.createAccountLinkToken({
+      userId: telegram.id,
+      provider: "vk",
+      tokenHash: "a".repeat(64),
+      expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+    });
+
+    const linked = await db.consumeVkAccountLink({
+      tokenHash: "a".repeat(64),
+      vkId: "700",
+      peerId: "700",
+      firstName: "Иван",
+      now: new Date("2026-08-31T00:00:00.000Z"),
+    });
+
+    expect(linked?.id).toBe(telegram.id);
+    expect((await db.getUserByVkId("700"))?.id).toBe(telegram.id);
+    expect((await db.getConfig(config.id))?.userId).toBe(telegram.id);
+  });
+
   it("скрывает конфиг после окончания десятидневного окна", async () => {
     const user = await db.upsertUser({ telegramId: "100", firstName: "Иван" });
     const now = new Date().toISOString();

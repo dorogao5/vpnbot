@@ -15,18 +15,57 @@ enum ConfigStatus {
   error
 }
 
+enum MessengerProvider {
+  telegram
+  vk
+}
+
 model User {
   id         Int         @id @default(autoincrement())
-  telegramId String      @unique @map("telegram_id")
+  telegramId String?     @unique @map("telegram_id")
   username   String?
   firstName  String      @map("first_name")
   createdAt  DateTime    @default(now()) @db.Timestamptz(3) @map("created_at")
   updatedAt  DateTime    @updatedAt @db.Timestamptz(3) @map("updated_at")
   configs    VpnConfig[]
   configRequests ConfigRequest[]
+  identities MessengerIdentity[]
+  linkTokens AccountLinkToken[]
 
   @@index([username])
   @@map("users")
+}
+
+model MessengerIdentity {
+  id         Int               @id @default(autoincrement())
+  userId     Int               @map("user_id")
+  provider   MessengerProvider
+  externalId String            @map("external_id")
+  peerId     String?           @map("peer_id")
+  username   String?
+  canMessage Boolean           @default(true) @map("can_message")
+  createdAt  DateTime          @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt  DateTime          @updatedAt @db.Timestamptz(3) @map("updated_at")
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, externalId])
+  @@unique([userId, provider])
+  @@index([provider, canMessage])
+  @@map("messenger_identities")
+}
+
+model AccountLinkToken {
+  id         String            @id @default(uuid()) @db.Uuid
+  userId     Int               @map("user_id")
+  provider   MessengerProvider
+  tokenHash  String            @unique @db.VarChar(64) @map("token_hash")
+  expiresAt  DateTime          @db.Timestamptz(3) @map("expires_at")
+  consumedAt DateTime?         @db.Timestamptz(3) @map("consumed_at")
+  createdAt  DateTime          @default(now()) @db.Timestamptz(3) @map("created_at")
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([provider, expiresAt])
+  @@map("account_link_tokens")
 }
 
 model VpnConfig {
